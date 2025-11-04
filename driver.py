@@ -365,6 +365,7 @@ class SoundDriver:
     #     # self.data_queue.send(self.middle_fft_data_list)
 
 
+
     def check_default_device_change(self):
         """
         检查默认设备是否发生变化，如果发生变化，则重启程序
