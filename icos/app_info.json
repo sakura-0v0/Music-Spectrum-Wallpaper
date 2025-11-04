@@ -5,9 +5,12 @@
   "dir_root": "xiaoe",
   "dir": "小娥频谱显示",
   "exe_name": "小娥频谱显示.exe",
-  "version": "4.0.0",
+  "version": "4.1.0",
   "icon_path":"icos/logo.ico",
   "text": "小娥频谱显示",
   "style": "pink",
-  "exclude_process": ["小娥频谱显示.exe"]
+  "exclude_process": ["小娥频谱显示.exe"],
+  "create_startmenu": "一只黄小娥",
+  "resign_regedit_and_create_uninstall": true,
+  "app_size_mb": 951
 }
