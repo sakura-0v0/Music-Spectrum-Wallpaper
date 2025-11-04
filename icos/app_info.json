@@ -1,0 +1,13 @@
+{
+  "app_id":1,
+  "app_name":"小娥频谱显示",
+  "name": "小娥频谱显示",
+  "dir_root": "xiaoe",
+  "dir": "小娥频谱显示",
+  "exe_name": "小娥频谱显示.exe",
+  "version": "4.0.0",
+  "icon_path":"icos/logo.ico",
+  "text": "小娥频谱显示",
+  "style": "pink",
+  "exclude_process": ["小娥频谱显示.exe"]
+}
