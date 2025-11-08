@@ -475,16 +475,6 @@ class Show(QtCore.QObject):
 
         # 创建右键菜单
         tray_menu = QtWidgets.QMenu()
-
-        # 锁定窗口菜单项
-        self.lock_action = QtWidgets.QAction("锁定窗口", self.win)
-        self.lock_action.setCheckable(True)
-        self.lock_action.triggered.connect(self.toggle_lock)
-        tray_menu.addAction(self.lock_action)
-        self.lock_action.setChecked(self.config.configget('is_locked'))
-        self.toggle_lock(self.config.configget('is_locked'))
-
-
         # 移动窗口菜单项
         self.was_locked = self.config.configget('is_locked')
         self.move_action = QtWidgets.QAction("移动窗口", self.win)
@@ -495,6 +485,17 @@ class Show(QtCore.QObject):
         move_reset = tray_menu.addAction("重置位置")
         move_reset.triggered.connect(self.move_reset)
 
+        tray_menu.addSeparator()
+
+        # 锁定窗口菜单项
+        self.lock_action = QtWidgets.QAction("锁定窗口", self.win)
+        self.lock_action.setCheckable(True)
+        self.lock_action.triggered.connect(self.toggle_lock)
+        tray_menu.addAction(self.lock_action)
+        self.lock_action.setChecked(self.config.configget('is_locked'))
+        self.toggle_lock(self.config.configget('is_locked'))
+
+        tray_menu.addSeparator()
         # 置顶窗口菜单项
         self.topmost_action = QtWidgets.QAction("置顶窗口", self.win)
         self.topmost_action.setCheckable(True)
@@ -503,7 +504,6 @@ class Show(QtCore.QObject):
         self.topmost_action.setChecked(self.config.configget('win_top'))
         self.toggle_topmost(self.config.configget('win_top'))
 
-        tray_menu.addSeparator()
 
         self.wallpaper_action = QtWidgets.QAction("壁纸模式", self.win)
         self.wallpaper_action.setCheckable(True)
@@ -511,6 +511,8 @@ class Show(QtCore.QObject):
         tray_menu.addAction(self.wallpaper_action)
         self.wallpaper_action.setChecked(self.config.configget('win_wallpaper'))
         QTimer.singleShot(50, lambda :self.set_as_wallpaper(first = True))
+
+        tray_menu.addSeparator()
 
         self.wallpaper_action_fill_screen = QtWidgets.QAction("壁纸全屏", self.win)
         self.wallpaper_action_fill_screen.setCheckable(True)

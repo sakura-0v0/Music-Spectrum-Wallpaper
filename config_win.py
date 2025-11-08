@@ -192,7 +192,7 @@ class ConfigWindow(QWidget):
 
         self.add_divider()
         # 音频处理
-        self.add_section_title("音频处理 - 数据块越小帧数上限越高")
+        self.add_section_title("音频采集 - 数据块越小帧数上限越高")
         # self.create_slider_input('chunk_a', "FFT倍数(x1024)", 1, 8, 1)
         self.create_combobox('driver_chunk', "数据块(需重启)",
                              [2**i for i in range(4, 14)])
