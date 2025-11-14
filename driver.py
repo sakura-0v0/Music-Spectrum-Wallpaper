@@ -310,8 +310,11 @@ class SoundDriver:
             "max_alpha": self.config.configget('max_alpha'),  # 6
             "data_pipe": self.data_pipe,  # 7
         })
-        fft_in_left_queue.put(((left_channel,right_channel), need_data))
+
         fft_in_left_queue.join()
+        fft_in_left_queue.put(((left_channel,right_channel), need_data))
+
+
         return True
         # fft_in_left_queue.put((left_channel, *need_data))
         # fft_in_right_queue.put((right_channel, *need_data))
@@ -338,31 +341,6 @@ class SoundDriver:
         self.stream.stop_stream()
         self.stream.close()
 
-
-    # def update_fft_data(self,middle_fft=None):
-    #     self.middle_fft_data_list.append(middle_fft)
-    #     c = len(self.middle_fft_data_list) - self.max_ftt_list_len
-    #     if c > 0:
-    #         # print(len(self.middle_fft_data_list) , self.max_ftt_list_len)
-    #         self.middle_fft_data_list = self.middle_fft_data_list[c:]
-    #
-    #     current_data = self.middle_fft_data_list[-1]  # 提取最新数据
-    #     # 计算滑动窗口均值
-    #     window = self.middle_fft_data_list[-self.config.configget('fft_window_size'):]
-    #     weights = self.config.configget('alpha') ** np.arange(len(window))[::-1]
-    #     a_middle = np.average(window, axis=0, weights=weights)
-    #     # magnitude_array = 20 * np.log10(
-    #     #     np.maximum(a_middle * 0.5, current_data) + 1e-10
-    #     # )
-    #     magnitude_array = 20 * np.log10(
-    #         a_middle + 1e-10
-    #     )
-    #     data_array = 20 * self.config.configget('max_alpha') * np.log10(
-    #         np.maximum(current_data, 0) + 1e-10
-    #     )
-    #     magnitudes = np.maximum(magnitude_array, data_array)  # 转换为列表后批量添加
-    #     self.data_pipe.send(magnitudes)
-    #     # self.data_queue.send(self.middle_fft_data_list)
 
 
 

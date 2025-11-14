@@ -1,4 +1,9 @@
 import ctypes
+import traceback
+
+import win32api
+import win32con
+import win32gui
 import threading
 import time
 from collections import deque
@@ -20,6 +25,8 @@ from pyqtgraph.Qt import QtWidgets
 from get_res import get_res_path
 from style import style
 from tools import restart
+from wallpaper_tools import set_windows_as_wallpaper
+
 
 class GetColor:
     def __init__(
@@ -262,11 +269,11 @@ class Show(QtCore.QObject):
             this_fft_page_timestamp = timestamp - self.last_data[0]
             if this_fft_page_timestamp <= 0:
                 this_fft_page_timestamp = 1e-6
-            # 计算逻辑帧率
-            this_fft_fps = 1 / this_fft_page_timestamp
-            # 计算显示帧数量
-            show_page_num = self.config.configget('target_fps')/this_fft_fps
-
+            # # 计算逻辑帧率
+            # this_fft_fps = 1 / this_fft_page_timestamp
+            # # 计算显示帧数量
+            # show_page_num = self.config.configget('target_fps')/this_fft_fps
+            show_page_num = self.config.configget('target_fps') * this_fft_page_timestamp
             # 计算显示帧间隔(s)
             show_page_timestamp = 1 / self.config.configget('target_fps')
             # print(show_page_timestamp)
@@ -596,6 +603,12 @@ class Show(QtCore.QObject):
     def enable_move(self,checked):
         """启用窗口移动功能"""
         # 暂时解锁窗口以便移动
+        # 增加键盘事件绑定（新增部分）
+        def enable_keyboard_move():
+            self.win.setFocusPolicy(QtCore.Qt.StrongFocus)
+            self.win.keyPressEvent = self.keyPressEvent  # 绑定键盘事件处理
+
+
         if checked:
             if self.config.configget('win_wallpaper'):
                 self.set_as_wallpaper(move_open=True)
@@ -604,9 +617,11 @@ class Show(QtCore.QObject):
                 self.toggle_lock(False)
 
             # 显示提示信息
-            self.tray.showMessage("窗口移动", "现在可以拖动窗口移动位置，点击完成移动",
-                                  QtWidgets.QSystemTrayIcon.Information, 2000)
+            # self.tray.showMessage("窗口移动", "现在可以拖动窗口移动位置，点击完成移动",
+            #                       QtWidgets.QSystemTrayIcon.Information, 2000)
 
+            # 新增键盘支持
+            enable_keyboard_move()
             # 启用鼠标事件跟踪
             self.win.setMouseTracking(True)
             self.margin = 8  # 边缘检测范围
@@ -620,9 +635,20 @@ class Show(QtCore.QObject):
             palette.setColor(QtGui.QPalette.Window, QtGui.QColor(0, 0, 0, 100))  # 半透明黑色
             self.win.setPalette(palette)
             self.win.update()  # 立即刷新界面
+            self.win.activateWindow()
+            self.win.raise_()
+            self.win.setFocus()  # 窗口获得焦点
+            self.show_visual_prompt(
+                "窗口可移动，边缘调大小。\n"
+                "小键盘方向键微调位置。\n"
+                "取消勾选“移动窗口”以保存位置大小。",
+                1000 * 5
+            )
         else:
 
             self.dragging = False
+            # 新增键盘事件解绑
+            self.win.keyPressEvent = lambda event: event.ignore()
             self.finish_move(self.was_locked)
             if self.was_locked:
                 self.toggle_lock(True)
@@ -759,12 +785,23 @@ class Show(QtCore.QObject):
         if event.button() == QtCore.Qt.LeftButton:
             self.mouse_state = 'normal'
             event.accept()
-        # if event.button() == QtCore.Qt.LeftButton:
-        #     self.dragging = False
-        #     event.accept()
-        #     # 调用完成移动的回调
-        #     if hasattr(self, 'move_callback'):
-        #         self.move_callback()
+
+    def keyPressEvent(self, event):
+        """小键盘方向键微调窗口位置（新增功能）"""
+        # print(event.key(),)
+        x, y = self.win.x(), self.win.y()
+        step = 1  # 微调步长
+
+        if event.key() == QtCore.Qt.Key_Left:
+            self.win.move(x - step, y)
+        elif event.key() == QtCore.Qt.Key_Right:
+            self.win.move(x + step, y)
+        elif event.key() == QtCore.Qt.Key_Up:
+            self.win.move(x, y - step)
+        elif event.key() == QtCore.Qt.Key_Down:
+            self.win.move(x, y + step)
+
+        event.accept()
 
     def window_change_event(self, event):
         print('window_change_event')
@@ -847,6 +884,16 @@ class Show(QtCore.QObject):
         WS_EX_TOOLWINDOW = 0x00000080
         WS_EX_NOACTIVATE = 0x08000000
 
+        try:
+            if not reset:
+                is_new_windows = set_windows_as_wallpaper(hwnd)
+            else:
+                is_new_windows = None
+        except Exception as e:
+            traceback.print_exc()
+            QMessageBox.warning(self.win, "设置为壁纸模式失败", f"\n{e}")
+            return
+
         # 设置窗口扩展样式
         ctypes.windll.user32.SetWindowLongW(
             hwnd,
@@ -854,52 +901,13 @@ class Show(QtCore.QObject):
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
         )
 
-        # 获取桌面窗口句柄
-        progman = ctypes.windll.user32.FindWindowW("Progman", "Program Manager")
-
-        # 发送特殊消息创建WorkerW窗口
-        ctypes.windll.user32.SendMessageTimeoutW(
-            progman,
-            0x052C,  # 特殊消息ID
-            0,
-            0,
-            0,
-            1000,
-            ctypes.byref(ctypes.c_ulong())
-        )
-
-        # 查找WorkerW窗口
-        def enum_windows(hwnd, param):
-            # 查找包含"SHELLDLL_DefView"的窗口
-            if ctypes.windll.user32.FindWindowExW(hwnd, 0, "SHELLDLL_DefView", None):
-                # 找到WorkerW窗口
-                workerw = ctypes.windll.user32.FindWindowExW(0, hwnd, "WorkerW", None)
-                # 将我们的窗口设置为WorkerW的子窗口
-                ctypes.windll.user32.SetParent(param, workerw)
-
-                ctypes.windll.user32.SetWindowPos(
-                    hwnd,
-                    workerw,  # 放在workerw后面
-                    0, 0, 0, 0,
-                    0x0001 | 0x0002  # SWP_NOSIZE | SWP_NOMOVE
-                )
-                return False
-            return True
-
-        # 定义回调函数类型
-        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
-        enum_windows_proc = WNDENUMPROC(enum_windows)
-
-        # 枚举窗口
-        ctypes.windll.user32.EnumWindows(enum_windows_proc, hwnd)
         # 关键修改：确保窗口背景透明
         # 1. 设置窗口背景为透明
         palette = self.win.palette()
         palette.setColor(QtGui.QPalette.Window, QtGui.QColor(0, 0, 0, 0))  # 完全透明
         self.win.setPalette(palette)
-        #
         # 获取窗口当前所在屏幕的物理参数
-        if self.config.configget('win_wallpaper_full_screen') or first or not reset:
+        if self.config.configget('win_wallpaper_full_screen') or (first and not is_new_windows) or not reset:
             current_screen = self.win.screen()  # 获取显示器物理坐标系
             screen_geo = [
                 current_screen.geometry().x(),
@@ -923,12 +931,13 @@ class Show(QtCore.QObject):
         self.win.setGeometry(*new_geometry)  # 精准对齐物理屏幕边界
 
         # 更新窗口位置和大小
+        self.win.setWindowTitle(APP_NAME)
         self.win.show()
         self.win.raise_()
         self.win.activateWindow()
 
-        if not self.config.configget('win_wallpaper_full_screen') and not reset:
-            self.set_as_wallpaper(reset=True)
+        if not self.config.configget('win_wallpaper_full_screen') and not reset:# and not is_new_windows:
+            self.set_as_wallpaper(reset=True) # 似乎新版的不需要再次设置了，但是再次设置一次也无所谓
 
 
 
@@ -1219,3 +1228,64 @@ class Show(QtCore.QObject):
                 self.win.show()
                 self.win.raise_()
                 self.win.activateWindow()
+
+    def show_visual_prompt(self, message, duration=2000):
+        """在窗口中央显示可视化提示"""
+        try:
+            # 创建提示标签（关键修改：使用独立窗口）
+            self.prompt_label = QtWidgets.QLabel()
+
+            # 必须设置的窗口标志（关键修复1）
+            self.prompt_label.setWindowFlags(
+                QtCore.Qt.ToolTip |
+                QtCore.Qt.FramelessWindowHint |
+                QtCore.Qt.WindowStaysOnTopHint |
+                QtCore.Qt.WindowTransparentForInput |  # 透明化输入
+                QtCore.Qt.WindowDoesNotAcceptFocus
+            )
+
+            # 透明背景设置（关键修复2）
+            self.prompt_label.setAttribute(QtCore.Qt.WA_TranslucentBackground)
+
+            # 设置醒目的文字样式（调整颜色对比度）
+            self.prompt_label.setStyleSheet("""
+                QLabel {
+                    color: pink;
+                    font: bold 28px;
+                    background-color: rgba(0, 0, 0, 180);
+                    border-radius: 15px;
+                    padding: 20px;
+                }
+            """)
+
+            self.prompt_label.setAlignment(QtCore.Qt.AlignCenter)
+            self.prompt_label.setText(message)
+            self.prompt_label.adjustSize()
+
+            # 定位到主窗口中心（关键修复3）
+            main_geo = self.win.geometry()
+            self.prompt_label.move(
+                main_geo.center().x() - self.prompt_label.width()//2,
+                main_geo.center().y() - self.prompt_label.height()//2
+            )
+
+            # 必须先show后启动动画（关键修复4）
+            self.prompt_label.show()
+
+            # 动画设置
+            self.animation = QtCore.QPropertyAnimation(self.prompt_label, b"windowOpacity")
+            self.animation.setDuration(1000)
+            self.animation.setStartValue(1.0)
+            self.animation.setEndValue(0.0)
+
+            # 定时器链式调用（关键修复5）
+            QtCore.QTimer.singleShot(duration - 1000, lambda:
+                self.animation.start()
+            )
+            QtCore.QTimer.singleShot(duration, lambda: (
+                self.prompt_label.deleteLater(),
+                self.prompt_label.close()
+            ))
+        except Exception as e:
+            traceback.print_exc()
+            print(f"可视化提示异常：{e}")

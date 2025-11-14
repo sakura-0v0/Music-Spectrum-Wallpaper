@@ -1125,7 +1125,7 @@ def show_config(
         config_process.top_win_queue.put(1)
         return
     config_process = ConfigInMainProcessPipe(config)
-    top_win_queue = Queue()
+    config_process.top_win_queue = Queue()
 
     show_config_process = Process(
         target=_show_config_process,
@@ -1134,7 +1134,7 @@ def show_config(
             config_process.config_set_queue,
             restart_queue,
             CountFpsShare.share_fps,
-            top_win_queue,
+            config_process.top_win_queue,
             maxsize_window,
             fill_screen_window,
         ),
