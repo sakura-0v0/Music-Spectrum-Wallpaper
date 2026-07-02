@@ -90,6 +90,7 @@ class CheckMaxSize:
             maxsize_window,
             fill_screen_window
     ):
+        self.quit_flag = False
         self.config = config
         self.maxsize_window = maxsize_window
         self.fill_screen_window = fill_screen_window
@@ -99,10 +100,15 @@ class CheckMaxSize:
         self.state_lock = threading.Event()
         threading.Thread(target=self.loop, daemon=True).start()
 
+    def quit(self):
+        self.quit_flag = True
+
     def loop(self):
         try:
              while True:
                 time.sleep(self.config.configget('screen_detect_time'))
+                if self.quit_flag:
+                    break
                 config_maximized = self.config.configget('maximized_screen_detect')
                 config_fullscreen = self.config.configget('full_screen_detect')
                 if not config_maximized and not config_fullscreen:
@@ -129,16 +135,15 @@ class CheckMaxSize:
             print(e)
         finally:
             self.state_lock.set()
+        print("quit_CheckMaxSize")
 
 
     def check_pause(self):
         """
         检查是否暂停
-        :return:
         """
         if self.state:
             self.state_lock.wait()
-        return
 
 
 

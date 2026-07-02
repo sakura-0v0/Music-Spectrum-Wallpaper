@@ -95,4 +95,4 @@ def create_workerw(parent_hwnd):
     return hwnd
 
 if __name__ == '__main__':
-    set_windows_as_wallpaper(0x1109E6)
+    set_windows_as_wallpaper(0x41920)

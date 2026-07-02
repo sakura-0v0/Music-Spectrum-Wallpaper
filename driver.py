@@ -1,3 +1,4 @@
+import multiprocessing
 import queue
 import struct
 import threading
@@ -7,10 +8,9 @@ from typing import Optional
 from scipy.signal import resample
 
 import numpy as np
-import pyaudio
+import pyaudiowpatch as pyaudio
 
 from check_maxsize import CheckMaxSize
-from fft_process import fft_in_left_queue
 from run_page import RunPage
 from tools import get_default_playback_id, set_high_timer_resolution, reset_timer_resolution
 
@@ -22,26 +22,25 @@ class SoundDriver:
     def __init__(
             self,
             config,
-            quit_pipe,
-            data_pipe,
             pl,
+            quit_driver_queue,
+            data_pipe,
             count_fps_FFT_value,
             count_fps_Record_value,
             maxsize_window,
             fill_screen_window,
-            restart_queue,
+            wait_quit_queue,
+            fft_in_left_queue,
             max_ftt_list_len = 50,
-
-
     ):
         # 设置高精度计时器
         self.high_res = set_high_timer_resolution()
-
         # 参数初始化
-        self.pl = pl
         self.config = config
+        self.pl = pl
         self.check_maxsize = CheckMaxSize(self.config,maxsize_window,fill_screen_window)
-        self.restart_queue = restart_queue
+        self.wait_quit_queue: multiprocessing.Queue = wait_quit_queue
+        self.fft_in_left_queue: multiprocessing.Queue = fft_in_left_queue
 
         self.last_default_device = None
 
@@ -56,7 +55,9 @@ class SoundDriver:
         self.format = None
         self.rate = None
 
-        self.quit_pipe = quit_pipe
+        self.closed = False
+
+        self.quit_driver_queue = quit_driver_queue
         self.data_pipe = data_pipe
 
         self.max_ftt_list_len = max_ftt_list_len
@@ -72,93 +73,64 @@ class SoundDriver:
 
         self.target_freqs = None  # 对数坐标的目标频率列表
         self.record_fft_thread = threading.Thread(target=self.record_fft_data_loop, daemon=True)
-        self.record_fft_data_loop_quit = False # 退出提取FFT数据的线程标志
         self.check_default = threading.Thread(target=self.check_default_device_change, daemon=True)
-        self.check_quit = threading.Thread(target=self.check_quit_thread, daemon=True)
 
-    def check_quit_thread(self):
-        """
-        检查退出线程
-        :return:
-        """
+
+    def sound_loop(self):
+        threading.Thread(
+            target=self._sound_loop,
+            daemon=True
+        ).start()
         try:
-            self.quit_pipe.recv()
+            self.quit_driver_queue.get()
         except:
             traceback.print_exc()
-        self.check_maxsize.state_lock.set()
         self.close()
 
 
     def get_input_device(self):
-        """查找 WASAPI 设备 """
+        """查找 WASAPI 回环设备（录制系统扬声器输出）"""
+        # 如果已有流，先关闭
+        if hasattr(self, 'stream') and self.stream:
+            self.stream.stop_stream()
+            self.stream.close()
         if self.pa is not None:
             self.pa.terminate()
+
         self.pa = pyaudio.PyAudio()
-        try:
-            default_device_info = self.pa.get_default_output_device_info()
-        except IOError:
-            default_device_info = {}
-        try:
-            # 1. 将这个字符串用它被错误解码的编码（通常是'latin-1'或'iso-8859-1'）编码回字节数据
-            original_bytes = default_device_info.get('name', '').encode('latin-1')
-            # 2. 将得到的字节数据用正确的编码（UTF-8）解码成字符串
-            good_string = original_bytes.decode('gbk')
-            # print(good_string)
-        except:
-            traceback.print_exc()
-            good_string = None
-        # Select Device
-        # print("设备列表:\n")
-        for i in range(0, self.pa.get_device_count()):
-            info = self.pa.get_device_info_by_index(i)
-            if info.get('hostApi') != 1:
-                continue
-            # print(str(info["index"]) + ": \t %s \n \t %s \n" % (info["name"],
-            #                                                     self.pa.get_host_api_info_by_index(
-            #                                                         info["hostApi"])[
-            #                                                         "name"]))
-            device_name = info.get('name', '')
-            if good_string in device_name or device_name == default_device_info['name']:
-                default_device_info = info
-                break
 
+        # 方法1：直接获取默认扬声器的回环设备（推荐）
+        loopback_info = self.pa.get_default_wasapi_loopback()
+        if not loopback_info:
+            raise RuntimeError("未找到任何 WASAPI 回环设备，请确保扬声器已启用并支持 WASAPI。")
 
-        # Handle no devices available
-        if not default_device_info:
-            print("No device available. Quitting.")
-            exit()
-        else:
-            wasapi_device = default_device_info["index"]
-            print(wasapi_device)
+        # 使用回环设备
+        wasapi_device_index = loopback_info["index"]
+        self.dev_info = loopback_info
 
+        self.channels = int(self.dev_info["maxInputChannels"])
+        self.rate = int(self.dev_info["defaultSampleRate"])
+        self.format = pyaudio.paInt16  # 或从 config 读取
 
-        # 设置录音参数
-        self.format = pyaudio.paInt16# config.get_format()
-        self.dev_info = self.pa.get_device_info_by_index(wasapi_device)
-        self.channels = self.dev_info["maxInputChannels"] if (self.dev_info["maxOutputChannels"] < self.dev_info["maxInputChannels"]) else self.dev_info["maxOutputChannels"]
-        print(self.dev_info)
-        self.rate = self.dev_info['defaultSampleRate']
-
+        # 从 config 读取其他参数
         self.driver_chunk = self.config.configget('driver_chunk')
         self.target_freqs = np.asarray(self.pl, dtype=np.float64)
 
         print(f"使用设备: {self.dev_info['name']}, 采样率: {self.rate}, 通道数: {self.channels}")
-        # 打开流
-        print(self.format, self.rate, self.channels, self.driver_chunk)
+
+        # 打开流（只读输入，回环设备本质是输入）
         self.stream = self.pa.open(
             format=self.format,
-            channels=int(self.channels),
-            rate=int(self.rate),
-            input_device_index=wasapi_device,
-            # output_device_index=wasapi_device,
+            channels=self.channels,
+            rate=self.rate,
+            input_device_index=wasapi_device_index,
             frames_per_buffer=self.driver_chunk,
             input=True,
-            as_loopback=True,
-            # input_host_api_specific_stream_info=p.get_host_api_info_by_index(0)
-            # output=True,
         )
 
-    def sound_loop(self):
+        print("WASAPI 回环流已成功打开！")
+        return self.stream
+    def _sound_loop(self):
         """
         获取音频数据并重采样处理
         :return:
@@ -166,27 +138,23 @@ class SoundDriver:
         print("开始录音...")
         while True:
             try:
-
                 self.check_maxsize.check_pause()
+                if self.closed:
+                    break
                 data = self.stream.read(self.driver_chunk, False)
                 # 执行重采样
                 self.sound_record(data)
-                # self.sound_queue.put(data)
-
 
             except OSError:
                 print("OSError")
-                self.restart_queue.put('restart')
+                self.wait_quit_queue.put('restart')
                 break
             except Exception as e:
                 traceback.print_exc()
-                self.restart_queue.put('restart')
+                self.wait_quit_queue.put('restart')
                 break
+        # if not self.closed:
 
-        # self.sound_queue.put(None)
-
-
-        self.close()
 
     def sound_record(self, data):
         """
@@ -241,7 +209,7 @@ class SoundDriver:
 
         while True:
             try:
-                if self.record_fft_data_loop_quit:
+                if self.closed:
                     self.check_maxsize.state_lock.set()
                     break
 
@@ -257,6 +225,7 @@ class SoundDriver:
             except :
                 time.sleep(0.005)
                 traceback.print_exc()
+
 
 
     # 新增辅助方法 -------------------------------------------------
@@ -311,35 +280,32 @@ class SoundDriver:
             "data_pipe": self.data_pipe,  # 7
         })
 
-        fft_in_left_queue.join()
-        fft_in_left_queue.put(((left_channel,right_channel), need_data))
+        self.fft_in_left_queue.join()
+        self.fft_in_left_queue.put(((left_channel,right_channel), need_data))
 
 
         return True
-        # fft_in_left_queue.put((left_channel, *need_data))
-        # fft_in_right_queue.put((right_channel, *need_data))
-        # fft_in_left_queue.send((left_channel, *need_data))
-        # fft_in_right_queue.send((right_channel, *need_data))
 
-        # left_fft = fft_out_left_queue.get()
-        # right_fft = fft_out_right_queue.get()
-        # # left_fft = fft_out_left_queue.recv()
-        # # right_fft = fft_out_right_queue.recv()
-        #
-        # middle_fft = np.maximum(left_fft, right_fft)
-        #
-        # self.update_fft_data(
-        #     middle_fft = middle_fft,
-        # )
 
     def close(self):
-        reset_timer_resolution(self.high_res)
-        fft_in_left_queue.put(None)
-        self.pa.terminate()
-        # fft_in_right_queue.put(None)
-        self.record_fft_data_loop_quit = True
-        self.stream.stop_stream()
-        self.stream.close()
+        print('run_close_driver')
+        self.closed = True
+        self.check_maxsize.quit()
+        self.check_maxsize.state_lock.set()
+        # try:
+        #     reset_timer_resolution(self.high_res)
+        # except Exception as e:
+        #     traceback.print_exc()
+
+
+        try:
+            self.stream.stop_stream()
+            self.stream.close()
+            self.pa.terminate()
+        except Exception as e:
+            traceback.print_exc()
+
+        print('run_close_driver_finished')
 
 
 
@@ -352,16 +318,13 @@ class SoundDriver:
         while True:
             try:
                 time.sleep(2)
+                if self.closed:
+                    break
                 now_default_device_info = get_default_playback_id()
                 if self.last_default_device is not None and now_default_device_info != self.last_default_device:
                     print('change default device')
-                    self.restart_queue.put('restart')
+                    self.wait_quit_queue.put('restart')
                     break
                 self.last_default_device = now_default_device_info
             except Exception as e:
                 traceback.print_exc()
-
-
-if __name__ == '__main__':
-    sd = SoundDriver()
-    sd.sound_loop()

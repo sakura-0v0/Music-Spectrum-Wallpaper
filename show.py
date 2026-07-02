@@ -1,9 +1,6 @@
 import ctypes
 import traceback
 
-import win32api
-import win32con
-import win32gui
 import threading
 import time
 from collections import deque
@@ -12,19 +9,16 @@ from typing import Callable
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt5.QtCore import QTimer, pyqtSignal
-from PyQt5.QtWidgets import QMessageBox
-from pyqtgraph.Qt import QtCore, QtGui
+from PySide6 import QtWidgets, QtGui, QtCore
+from PySide6.QtCore import QTimer, Signal, QRect
+from PySide6.QtGui import QAction, QGuiApplication
+from PySide6.QtWidgets import QMessageBox, QVBoxLayout
+from xiaoe_ui import FramelessWin
 
-from config import APP_NAME
-from config_multiprocess import ConfigInMainProcessPipe
-from config_win import show_config
+from app_info import APP_NAME
 from count_fps import CountFps
-from pyqtgraph.Qt import QtWidgets
 
 from get_res import get_res_path
-from style import style
-from tools import restart
 from wallpaper_tools import set_windows_as_wallpaper
 
 
@@ -64,13 +58,10 @@ class GetColor:
             color_config = self.get_color_config()
             gradient = self.run_func()
             for item in color_config:
-                y = item['y']
+                y = item['pos']
                 color = item['color']
                 gradient.setColorAt(y, self.run_func2(*color))
             return self.run_func3(gradient)
-
-
-            return
 
         if self.last_color_config != self.get_color_config():
             self.last_color_config = self.get_color_config()
@@ -81,68 +72,68 @@ class GetColor:
 
 
 
-class Show(QtCore.QObject):
-    quit_signal = pyqtSignal()
+class Show(FramelessWin):
+    quit_signal = Signal()
     def __init__(
             self,
             config,
+            qt_app,
+            pl,
             maxsize_window,
             fill_screen_window,
-            win_quit_queue,
-            restart_queue,
+            wait_quit_queue,
+            quit_show_queue,
+            left_volume_value,
+            right_volume_value,
+            fps,
+            open_main_win,
     ):
-        super().__init__()
-        # 初始化图形界面
+        self.open_main_win = open_main_win
         self.config = config
+        self.qt_app = qt_app
+        self.lock_status = True
+        self.true_xy = (0, 0)
+        super().__init__(
+            min_w=80, min_h=50,
+            on_top_with_global = False,
+            cuantou=True,
+        )
+        # 初始化图形界面
+
+        self.pl = pl
         self.maxsize_window = maxsize_window
         self.fill_screen_window = fill_screen_window
-        self.win_quit_queue = win_quit_queue
-        self.restart_queue = restart_queue
-
-        self.app = pg.mkQApp(APP_NAME)
-        self.fps = CountFps("显示")
+        self.win_quit_queue = wait_quit_queue
+        self.quit_show_queue = quit_show_queue
+        self.left_volume_value = left_volume_value
+        self.right_volume_value = right_volume_value
+        self.fps = CountFps("显示",fps)
         fmt = QtGui.QSurfaceFormat()
         fmt.setSwapInterval(0)  # 关键参数：0=禁用VSync, 1=启用VSync
         fmt.setRenderableType(QtGui.QSurfaceFormat.OpenGL)
         QtGui.QSurfaceFormat.setDefaultFormat(fmt)
         pg.setConfigOptions(
             useOpenGL=True,
-            # enableExperimental=True
             background=None
         )
 
-        self.win = pg.GraphicsLayoutWidget(
-            # show=True,
-        )
-        self.win.setWindowIcon(QtGui.QIcon(get_res_path("icos/logo.ico")))
+        self.win = pg.GraphicsLayoutWidget()
 
-        self.min_width = 80
-        self.min_height = 50
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)
 
-
-        self.win.setAttribute(QtCore.Qt.WA_TranslucentBackground)
+        self.layout.addWidget(self.win)
 
 
-        palette = self.win.palette()
+
+        palette = self.palette()
         palette.setColor(QtGui.QPalette.Window, QtGui.QColor(0, 0, 0, 0))
-        self.win.setPalette(palette)
-
-        self.win.setWindowFlags(
-            QtCore.Qt.FramelessWindowHint |
-            # QtCore.Qt.WindowStaysOnTopHint |  # 确保窗口在最前
-            QtCore.Qt.Tool  # 添加Tool标志，这有助于无边框窗口显示
-        )
-        self.mouse_state = None
-        self.win.resize(*config.configget('win_size'))
-        if config.configget('win_xy'):
-            self.win.move(*config.configget('win_xy'))
-        self.win.show()
-        self.win.raise_()
-        self.win.activateWindow()
+        self.setPalette(palette)
+        self.show()
+        self.raise_()
+        self.activateWindow()
         self.init_ui()
         self.init_tray()
-
-        self.win.changeEvent = self.window_change_event
 
     def init_ui(self):
 
@@ -150,9 +141,6 @@ class Show(QtCore.QObject):
         self.y_t= self.max_db * self.config.configget('gradient_max_height')
         self.y_b = self.max_db * self.config.configget('gradient_min_height')
         # 创建全局渐变
-        # self.gradient = QtGui.QLinearGradient(0, self.y_t, 0, self.y_b)  # 从y_max到y_min渐变
-        # self.gradient.setColorAt(0, QtGui.QColor(*config.configget('gradient_color_top')))  # 蓝
-        # self.gradient.setColorAt(1, QtGui.QColor(*config.configget('gradient_color_bottom')))  # 红
 
         self.bars_color = GetColor(
             "gradient_color",
@@ -182,7 +170,7 @@ class Show(QtCore.QObject):
         )
 
         self.axis = pg.AxisItem(orientation='bottom')
-        self.axis.setTicks([[(i, str(f)) for i, f in enumerate(self.config.pl)]])
+        self.axis.setTicks([[(i, str(f)) for i, f in enumerate(self.pl)]])
         self.axis.setTicks([])  # 禁用刻度线
         self.axis.setPen(pg.mkPen(width=0))  # 设置轴线为透明
 
@@ -191,7 +179,7 @@ class Show(QtCore.QObject):
         self.plot.addItem(self.bars)
 
         self.plot.setYRange(self.y_b, self.y_t)
-        self.plot.setXRange(1, len(self.config.pl) - 2)
+        self.plot.setXRange(1, len(self.pl) - 2)
         self.plot.setMouseEnabled(x=False, y=False)
         # self.plot.getViewBox().setBackgroundColor(None)
 
@@ -200,19 +188,19 @@ class Show(QtCore.QObject):
 
         # 峰值
         # 初始化峰值数组
-        self.peak_heights = np.zeros_like(self.config.pl)
-        self.peak_velocities = np.zeros(len(self.config.pl))
+        self.peak_heights = np.zeros_like(self.pl)
+        self.peak_velocities = np.zeros(len(self.pl))
         # 创建峰值保持条
         self.peak_bars = pg.BarGraphItem(
             x=[],
-            height=np.full(len(self.config.pl), 0.01),  # 横条高度固定3像素
+            height=np.full(len(self.pl), 0.01),  # 横条高度固定3像素
             width=self.config.configget('peak_bars_width'),  # 比主柱子略宽
             brush=self.peak_color.get_color(),  # QtGui.QBrush(QtGui.QColor(*config.configget('peak_bars_color'))),  # 半透明白色
             pen=None,
             useOpenGL=True
         )
         self.plot.addItem(self.peak_bars)
-        self.peak_heights = np.zeros(len(self.config.pl))  # 新增峰值高度数组
+        self.peak_heights = np.zeros(len(self.pl))  # 新增峰值高度数组
         self.last_peak_update = time.time()
 
         # 粒子效果
@@ -228,15 +216,17 @@ class Show(QtCore.QObject):
         self.timer.setTimerType(QtCore.Qt.PreciseTimer)
         self.timer.timeout.connect(self._process_buffer)
         self.timer.start(1)
-        self.quit_signal.connect(self.quit_show, QtCore.Qt.ConnectionType.QueuedConnection | QtCore.Qt.ConnectionType.UniqueConnection)
-        threading.Thread(target= self.check_quit).start()
+        self.quit_signal.connect(self.quit_show, QtCore.Qt.QueuedConnection)
+        threading.Thread(target= self.check_quit, daemon=True).start()
 
     def check_quit(self):
-        self.win_quit_queue.get()
+        self.quit_show_queue.get(block=True)
         self.quit_signal.emit()
 
+
     def quit_show(self):
-        self.app.quit()
+        self.close()
+        self.qt_app.quit()
         print('quit_show_win-------------------')
 
 
@@ -252,6 +242,7 @@ class Show(QtCore.QObject):
 
         self._update_peaks(x, y)
         self._update_balls(x, y)
+        # self._update_volume()
         self.fps.count_fps()
 
 
@@ -282,7 +273,9 @@ class Show(QtCore.QObject):
         self.last_data = data
 
     def _interpolate(self,data,last_data, show_page_num , show_page_timestamp):
-        """线性插值计算当前帧数据"""
+        """
+        线性插值计算当前帧数据
+        """
         last_timestamp, last_x, last_y = last_data
         now_timestamp, now_x, now_y = data
 
@@ -307,7 +300,9 @@ class Show(QtCore.QObject):
 
 
     def _process_buffer(self):
-        """处理缓冲区数据"""
+        """
+        处理缓冲区数据
+        """
         if not self.data_buffer:  # <-- 关键！防止空缓冲区访问
 
             return
@@ -324,7 +319,9 @@ class Show(QtCore.QObject):
         self.data_buffer.popleft()
 
     def _update_peaks(self, x, current_heights):
-        """更新峰值横条位置"""
+        """
+        更新峰值横条位置
+        """
         if not self.config.configget('peak_bars_show'):
             if self.peak_bars.isVisible():
                 self.peak_bars.hide()
@@ -373,7 +370,9 @@ class Show(QtCore.QObject):
             )
 
     def _update_balls(self, x, y):
-        """向量化优化的粒子系统"""
+        """
+        向量化优化的粒子系统
+        """
         if not self.config.configget('ball_show'):
             if hasattr(self, 'scatter') and hasattr(self, 'balls'):
                 # 重置粒子系统为向量化结构
@@ -472,39 +471,40 @@ class Show(QtCore.QObject):
 
         # 保存当前y值
         np.copyto(self.prev_y, current_y)
-
+    def _update_volume(self,):
+        print(f"当前音量(L): {self.left_volume_value.value:.1f}% | (R): {self.right_volume_value.value:.1f}%")
 
     def init_tray(self):
         # 创建系统托盘图标
-        self.tray = QtWidgets.QSystemTrayIcon(self.win)
-        # 如果没有图标文件，可以使用默认图标
+        self.tray = QtWidgets.QSystemTrayIcon(self)
         self.tray.setIcon(QtGui.QIcon(get_res_path("icos/logo.ico")))
+        self.tray.setToolTip(APP_NAME)
+
 
         # 创建右键菜单
         tray_menu = QtWidgets.QMenu()
-        # 移动窗口菜单项
-        self.was_locked = self.config.configget('is_locked')
-        self.move_action = QtWidgets.QAction("移动窗口", self.win)
-        self.move_action.setCheckable(True)
-        self.move_action.triggered.connect(self.enable_move)
-        tray_menu.addAction(self.move_action)
-
-        move_reset = tray_menu.addAction("重置位置")
-        move_reset.triggered.connect(self.move_reset)
 
         tray_menu.addSeparator()
 
+        quit_action = tray_menu.addAction("选项")
+
+        quit_action.triggered.connect(
+            lambda :self.open_main_win.put(None)
+        )
+
+        # 分隔线
+        tray_menu.addSeparator()
         # 锁定窗口菜单项
-        self.lock_action = QtWidgets.QAction("锁定窗口", self.win)
+        self.lock_action = QAction("锁定窗口", self)
         self.lock_action.setCheckable(True)
         self.lock_action.triggered.connect(self.toggle_lock)
         tray_menu.addAction(self.lock_action)
-        self.lock_action.setChecked(self.config.configget('is_locked'))
-        self.toggle_lock(self.config.configget('is_locked'))
+        self.lock_action.setChecked(True)
+        self.toggle_lock(True)
 
         tray_menu.addSeparator()
         # 置顶窗口菜单项
-        self.topmost_action = QtWidgets.QAction("置顶窗口", self.win)
+        self.topmost_action = QAction("置顶窗口", self)
         self.topmost_action.setCheckable(True)
         self.topmost_action.triggered.connect(self.toggle_topmost)
         tray_menu.addAction(self.topmost_action)
@@ -512,7 +512,7 @@ class Show(QtCore.QObject):
         self.toggle_topmost(self.config.configget('win_top'))
 
 
-        self.wallpaper_action = QtWidgets.QAction("壁纸模式", self.win)
+        self.wallpaper_action = QAction("壁纸模式", self)
         self.wallpaper_action.setCheckable(True)
         self.wallpaper_action.triggered.connect(self.set_as_wallpaper)
         tray_menu.addAction(self.wallpaper_action)
@@ -521,37 +521,24 @@ class Show(QtCore.QObject):
 
         tray_menu.addSeparator()
 
-        self.wallpaper_action_fill_screen = QtWidgets.QAction("壁纸全屏", self.win)
+        self.wallpaper_action_fill_screen = QAction("壁纸全屏", self)
         self.wallpaper_action_fill_screen.setCheckable(True)
         self.wallpaper_action_fill_screen.triggered.connect(self.set_wallpaper_full_screen)
         tray_menu.addAction(self.wallpaper_action_fill_screen)
         self.wallpaper_action_fill_screen.setChecked(self.config.configget('win_wallpaper_full_screen'))
 
-        quit_action = tray_menu.addAction("壁纸偏移")
-        quit_action.triggered.connect(self.set_wallpaper_offset)
-
+        # quit_action = tray_menu.addAction("壁纸偏移")
+        # quit_action.triggered.connect(self.set_wallpaper_offset)
         tray_menu.addSeparator()
-        quit_action = tray_menu.addAction("选项")
-
-        quit_action.triggered.connect(lambda :show_config(
-            self.config,
-            self.maxsize_window,
-            self.fill_screen_window,
-            self.restart_queue,
-        ))
-
-        # 分隔线
-        tray_menu.addSeparator()
-
         # 重启
         quit_action = tray_menu.addAction("重启")
-        quit_action.triggered.connect(lambda :self.restart_queue.put("restart"))
+        quit_action.triggered.connect(lambda :self.win_quit_queue.put("restart"))
         # 退出菜单项
 
 
         quit_action = tray_menu.addAction("退出")
         def quit_func():
-            self.win_quit_queue.put(None)
+            self.win_quit_queue.put("quit")
         quit_action.triggered.connect(quit_func)
 
         self.tray.setContextMenu(tray_menu)
@@ -559,277 +546,96 @@ class Show(QtCore.QObject):
 
         # 托盘图标点击事件
         self.tray.activated.connect(self.tray_activated)
+
+    def enter_edit_mode(self):
+        super().enter_edit_mode()
+
     def toggle_lock(self, checked = None):
         """切换窗口锁定状态"""
-        if checked is not None:
-            self.config.configset('is_locked', checked)
-        # 获取当前窗口标志（包含已有的置顶设置）
-        current_flags = self.win.windowFlags()
-
-        # 核心修改：通过窗口标记控制输入接收
-        if self.config.configget('is_locked'):
-            new_flags = (current_flags |  # 保留原有设置
-                         QtCore.Qt.WindowTransparentForInput |  # 透明化输入
-                         QtCore.Qt.WindowDoesNotAcceptFocus)  # 禁止获取焦点
-        else:
-            new_flags = (current_flags &
-                         ~QtCore.Qt.WindowTransparentForInput &  # 恢复输入
-                         ~QtCore.Qt.WindowDoesNotAcceptFocus)  # 允许焦点
-
-        self.win.setWindowFlags(new_flags)
-        # 重新显示窗口以应用新的窗口标志
-        self.win.show()
-        self.toggle_topmost(self.config.configget('win_top'))
-
-    def move_reset(self):
-        def handle_result(button):
-            if button == QMessageBox.Yes:
-                self.config.configreset('win_xy')
-                restart(self.win_quit_queue)
-        msg_box = QMessageBox()
-        msg_box.setWindowIcon(QtGui.QIcon(get_res_path("icos/logo.ico")))
-        msg_box.setWindowTitle("重置提示")  # 标题
-        msg_box.setText("确定要重置窗口位置吗？")  # 提示内容
-        msg_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        self.app.setQuitOnLastWindowClosed(False)
-        # 独立事件循环管理
-        loop = QtCore.QEventLoop()
-        msg_box.finished.connect(loop.quit)
-        msg_box.buttonClicked.connect(lambda btn: handle_result(msg_box.standardButton(btn)))
-        msg_box.show()
-        loop.exec_()  # 局部事件循环
-        self.app.setQuitOnLastWindowClosed(True)  # 恢复默认设置
-
-    def enable_move(self,checked):
-        """启用窗口移动功能"""
-        # 暂时解锁窗口以便移动
-        # 增加键盘事件绑定（新增部分）
-        def enable_keyboard_move():
-            self.win.setFocusPolicy(QtCore.Qt.StrongFocus)
-            self.win.keyPressEvent = self.keyPressEvent  # 绑定键盘事件处理
-
 
         if checked:
-            if self.config.configget('win_wallpaper'):
-                self.set_as_wallpaper(move_open=True)
-            self.was_locked = self.config.configget('is_locked')
-            if self.config.configget('is_locked'):
-                self.toggle_lock(False)
-
-            # 显示提示信息
-            # self.tray.showMessage("窗口移动", "现在可以拖动窗口移动位置，点击完成移动",
-            #                       QtWidgets.QSystemTrayIcon.Information, 2000)
-
-            # 新增键盘支持
-            enable_keyboard_move()
-            # 启用鼠标事件跟踪
-            self.win.setMouseTracking(True)
-            self.margin = 8  # 边缘检测范围
-            self.mouse_state = 'normal'  # 新增状态标识：normal/moving/resizing
-
-            self.win.mousePressEvent = self.mouse_press_event
-            self.win.mouseMoveEvent = self.mouse_move_event
-            self.win.mouseReleaseEvent = self.mouse_release_event
-
-            palette = self.win.palette()
-            palette.setColor(QtGui.QPalette.Window, QtGui.QColor(0, 0, 0, 100))  # 半透明黑色
-            self.win.setPalette(palette)
-            self.win.update()  # 立即刷新界面
-            self.win.activateWindow()
-            self.win.raise_()
-            self.win.setFocus()  # 窗口获得焦点
-            self.show_visual_prompt(
-                "窗口可移动，边缘调大小。\n"
-                "小键盘方向键微调位置。\n"
-                "取消勾选“移动窗口”以保存位置大小。",
-                1000 * 5
-            )
-        else:
-
-            self.dragging = False
-            # 新增键盘事件解绑
-            self.win.keyPressEvent = lambda event: event.ignore()
-            self.finish_move(self.was_locked)
-            if self.was_locked:
-                self.toggle_lock(True)
+            # 锁定状态
+            self.exit_edit_mode()
+            self.lock_status = checked
             if self.config.configget('win_wallpaper'):
                 self.set_as_wallpaper()
-    def get_resize_edge(self, pos):
-        """根据鼠标位置判断是否在边缘区域"""
-        rect = self.win.rect()
-        edge = []
-        if pos.x() < self.margin: edge.append('left')
-        elif pos.x() > rect.width()-self.margin: edge.append('right')
-        if pos.y() < self.margin: edge.append('top')
-        elif pos.y() > rect.height()-self.margin: edge.append('bottom')
-        return edge
-    def finish_move(self, was_locked):
-        """完成窗口移动"""
-        # 恢复鼠标事件
-        self.win.mousePressEvent = None
-        self.win.mouseMoveEvent = None
-        self.win.mouseReleaseEvent = None
-        self.mouse_state = None
-        # 恢复透明背景
-        palette = self.win.palette()
-        palette.setColor(QtGui.QPalette.Window, QtGui.QColor(0, 0, 0, 0))  # 完全透明
-        self.win.setPalette(palette)
-        self.win.update()
-        # 返回窗口的几何信息（包含位置和大小）: QRect(x, y, width, height)
-        geometry = self.win.geometry()
 
-        # 提取位置和大小
-        x = geometry.x()
-        y = geometry.y()
-        width = geometry.width()
-        height = geometry.height()
-        self.config.configset(
-            'win_size',
-            (width, height)
-        )
-        self.config.configset(
-            'win_xy',
-            (x, y)
-        )
-
-        # 如果之前是锁定状态，恢复锁定
-        if was_locked:
-            self.toggle_lock(True)
-
-
-    def mouse_press_event(self, event):
-        """鼠标按下事件 - 用于窗口移动"""
-        if not (event.button() == QtCore.Qt.LeftButton):
-            return
-        resize_edge = self.get_resize_edge(event.pos())
-        if resize_edge:
-            self.mouse_state = 'resizing'
-            self.resize_edge = resize_edge
-            self.start_geometry = self.win.geometry()
-            self.start_pos = event.pos()  # 改用窗口相对坐标
-            self.start_global_pos = event.globalPos()  # 保留全局坐标
         else:
-            self.mouse_state = 'moving'
-            self.dragging = True
-            self.drag_position = event.globalPos() - self.win.frameGeometry().topLeft()
+            self.lock_status = checked
+            if self.config.configget('win_wallpaper'):
+                self.set_as_wallpaper(move_open=True)
+            self.enter_edit_mode()
 
-        event.accept()
-
-    def mouse_move_event(self, event):
-        """鼠标移动事件 - 用于窗口移动"""
-        if self.mouse_state == 'moving':
-            if self.dragging and event.buttons() & QtCore.Qt.LeftButton:
-                self.win.move(event.globalPos() - self.drag_position)
-                event.accept()
-
-        elif self.mouse_state == 'resizing':
-            # 新增缩放逻辑
-            pos = event.pos()
-            global_pos = event.globalPos()
-
-            # 计算相对移动量（基于窗口坐标系）
-            delta = pos - self.start_pos
-
-            # 计算基于全局坐标的增量
-            global_delta = global_pos - self.start_global_pos
-
-            new_geo = self.start_geometry
-
-            if 'left' in self.resize_edge:
-                new_geo.setLeft(new_geo.left() + global_delta.x())
-            if 'right' in self.resize_edge:
-                new_geo.setRight(new_geo.right() + global_delta.x())
-            if 'top' in self.resize_edge:
-                new_geo.setTop(new_geo.top() + global_delta.y())
-            if 'bottom' in self.resize_edge:
-                new_geo.setBottom(new_geo.bottom() + global_delta.y())
-            # 限制最小尺寸（可选）
-            if new_geo.width() < self.min_width:
-                if 'left' in self.resize_edge:
-                    new_geo.setLeft(new_geo.right() - 100)
-                else:
-                    new_geo.setRight(new_geo.left() + 100)
-            if new_geo.height() < self.min_height:
-                if 'top' in self.resize_edge:
-                    new_geo.setTop(new_geo.bottom() - 50)
-                else:
-                    new_geo.setBottom(new_geo.top() + 50)
-            self.win.setGeometry(new_geo)
-            self.start_global_pos = global_pos
-            event.accept()
-
-        elif self.mouse_state:
-            # 更新鼠标形状
-            edge = self.get_resize_edge(event.pos())
-            cursor = QtCore.Qt.ArrowCursor
-            if edge:
-                if {'left', 'top'} <= set(edge):
-                    cursor = QtCore.Qt.SizeFDiagCursor  # 左上-右下
-                elif {'right', 'bottom'} <= set(edge):
-                    cursor = QtCore.Qt.SizeFDiagCursor  # 右下-左上
-                elif {'right', 'top'} <= set(edge):
-                    cursor = QtCore.Qt.SizeBDiagCursor  # 右上-左下
-                elif {'left', 'bottom'} <= set(edge):
-                    cursor = QtCore.Qt.SizeBDiagCursor  # 左下-右上
-                elif 'left' in edge or 'right' in edge:
-                    cursor = QtCore.Qt.SizeHorCursor
-                elif 'top' in edge or 'bottom' in edge:
-                    cursor = QtCore.Qt.SizeVerCursor
-            else:
-                cursor = QtCore.Qt.SizeAllCursor
-
-            self.win.setCursor(cursor)
-
-    def mouse_release_event(self, event):
-        """鼠标释放事件 - 用于窗口移动"""
-        if event.button() == QtCore.Qt.LeftButton:
-            self.mouse_state = 'normal'
-            event.accept()
+        self.toggle_topmost(self.config.configget('win_top'))
 
     def keyPressEvent(self, event):
         """小键盘方向键微调窗口位置（新增功能）"""
         # print(event.key(),)
-        x, y = self.win.x(), self.win.y()
+        x, y = self.x(), self.y()
         step = 1  # 微调步长
 
         if event.key() == QtCore.Qt.Key_Left:
-            self.win.move(x - step, y)
+            self.move(x - step, y)
         elif event.key() == QtCore.Qt.Key_Right:
-            self.win.move(x + step, y)
+            self.move(x + step, y)
         elif event.key() == QtCore.Qt.Key_Up:
-            self.win.move(x, y - step)
+            self.move(x, y - step)
         elif event.key() == QtCore.Qt.Key_Down:
-            self.win.move(x, y + step)
+            self.move(x, y + step)
 
         event.accept()
 
-    def window_change_event(self, event):
+    def changeEvent(self, event):
+        super().changeEvent(event)
         print('window_change_event')
 
     def toggle_topmost(self, checked = None):
         """切换窗口置顶状态"""
         if checked is not None:
             self.config.configset('win_top', checked)
-        if self.config.configget('win_top'):
-            # 置顶窗口
-            self.win.setWindowFlags(self.win.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
-            # self.topmost_action.setText("取消置顶")
         else:
-            # 取消置顶
-            # self.win.setWindowFlags(self.win.windowFlags() & ~QtCore.Qt.WindowStaysOnTopHint)
-            # self.topmost_action.setText("置顶窗口")
-            flags = self.win.windowFlags()
-            flags &= ~QtCore.Qt.WindowStaysOnTopHint  # 移除置顶标志
-            # flags |= QtCore.Qt.Tool  # 确保工具窗口标志存在
-            self.win.setWindowFlags(flags)
-
-        # 重新显示窗口以应用新的窗口标志
-        self.win.show()
-
-
-        if not self.config.configget('win_top'):
+            checked = self.config.configget('win_top')
+        self.on_top(checked)
+        if not checked:
             self.set_windows_bottom()
 
+    def _load_config(self):
+        self.resize(*self.config.configget('win_size'))
+        win_xy = self.config.configget('win_xy')
+        self.true_xy = win_xy
+        if win_xy:
+            win_xy = self.apply_wallpaper_xy_offset(win_xy)
+            self.move(*win_xy)
+
+    def _save_config(self):
+        if not self.lock_status:
+            self.true_xy = self.x(), self.y()
+        self.config.configset('win_xy', self.true_xy)
+        self.config.configset('win_size', (self.width(), self.height()))
+
+    def apply_wallpaper_xy_offset(self, old):
+        """将 old 坐标从 Qt 坐标系（主屏左上角为原点）转换到
+           虚拟桌面坐标系（整个桌面的最左上角为原点）。"""
+        if not self.config.configget('win_wallpaper') or not self.lock_status:
+            return old
+        app = QGuiApplication.instance()
+
+        # 1. 所有屏幕 geometry 的并集 → 虚拟桌面矩形
+        virtual_rect = QRect()
+        for screen in app.screens():
+            virtual_rect = virtual_rect.united(screen.geometry())
+
+        # 2. 虚拟桌面左上角在 Qt 坐标系中的坐标（通常为负或 0）
+        virtual_origin = virtual_rect.topLeft()
+
+        # 3. 主屏在虚拟桌面坐标系中的偏移 = (0, 0) - virtual_origin
+        offset_x = -virtual_origin.x()
+        offset_y = -virtual_origin.y()
+
+        old = list(old)
+        old[0] += offset_x
+        old[1] += offset_y
+        return old
 
     def set_as_wallpaper(
             self,
@@ -841,14 +647,16 @@ class Show(QtCore.QObject):
         """将窗口设置为壁纸（位于桌面图标下方）"""
         # 获取窗口句柄
         if checked is not None:
-            if self.mouse_state:
+            if self.is_edit_mode:
                 # 禁止在移动模式下更改壁纸模式
-                QMessageBox.warning(self.win, "警告", "请先完成窗口移动，再切换壁纸模式。")
+                QMessageBox.warning(self, "警告", "请先完成窗口移动，再切换壁纸模式。")
                 self.wallpaper_action.setChecked(self.config.configget('win_wallpaper'))
                 return
             self.config.configset('win_wallpaper', checked)
-        hwnd = int(self.win.winId())
-        if not self.config.configget('win_wallpaper') or move_open:
+        else:
+            checked = self.config.configget('win_wallpaper')
+        hwnd = int(self.winId())
+        if not checked or move_open:
             if not hasattr(self,'original_parent'):
                 return
             # 恢复父窗口关系
@@ -856,24 +664,21 @@ class Show(QtCore.QObject):
 
             # 还原窗口样式
             ctypes.windll.user32.SetWindowLongW(hwnd, -20, self.original_exstyle)
-            self.win.setAttribute(QtCore.Qt.WA_TranslucentBackground)
+            self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
 
-            palette = self.win.palette()
+            palette = self.palette()
             palette.setColor(QtGui.QPalette.Window, QtGui.QColor(0, 0, 0, 0))
-            self.win.setPalette(palette)
-            self.win.setWindowFlags(
+            self.setPalette(palette)
+            self.setWindowFlags(
                 QtCore.Qt.FramelessWindowHint |
-                # QtCore.Qt.WindowStaysOnTopHint |  # 确保窗口在最前
                 QtCore.Qt.Tool  # 添加Tool标志，这有助于无边框窗口显示
             )
-            self.win.resize(*self.config.configget('win_size'))
-            if self.config.configget('win_xy'):
-                self.win.move(*self.config.configget('win_xy'))
-            self.toggle_lock()
+            self._load_config()
+            # self.toggle_lock()
             self.toggle_topmost()
-            self.win.show()
-            self.win.raise_()
-            self.win.activateWindow()
+            self.show()
+            self.raise_()
+            self.activateWindow()
             return
         self.original_exstyle = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
         self.original_parent = ctypes.windll.user32.GetParent(hwnd)
@@ -891,7 +696,7 @@ class Show(QtCore.QObject):
                 is_new_windows = None
         except Exception as e:
             traceback.print_exc()
-            QMessageBox.warning(self.win, "设置为壁纸模式失败", f"\n{e}")
+            QMessageBox.warning(self, "设置为壁纸模式失败", f"\n{e}")
             return
 
         # 设置窗口扩展样式
@@ -903,12 +708,12 @@ class Show(QtCore.QObject):
 
         # 关键修改：确保窗口背景透明
         # 1. 设置窗口背景为透明
-        palette = self.win.palette()
+        palette = self.palette()
         palette.setColor(QtGui.QPalette.Window, QtGui.QColor(0, 0, 0, 0))  # 完全透明
-        self.win.setPalette(palette)
+        self.setPalette(palette)
         # 获取窗口当前所在屏幕的物理参数
         if self.config.configget('win_wallpaper_full_screen') or (first and not is_new_windows) or not reset:
-            current_screen = self.win.screen()  # 获取显示器物理坐标系
+            current_screen = self.screen()  # 获取显示器物理坐标系
             screen_geo = [
                 current_screen.geometry().x(),
                 current_screen.geometry().y(),
@@ -923,18 +728,22 @@ class Show(QtCore.QObject):
                 *xy,
                 *self.config.configget('win_size'),
             ]
-        print(screen_geo)
-        config_geometry = self.config.configget('win_wallpaper_xywh_offset')
-        new_geometry = []
-        for index, value in enumerate(config_geometry):
-            new_geometry.append(screen_geo[index] + value)
-        self.win.setGeometry(*new_geometry)  # 精准对齐物理屏幕边界
+
+        # print(screen_geo)
+        # config_geometry = self.config.configget('win_wallpaper_xywh_offset')
+        # new_geometry = []
+        # for index, value in enumerate(config_geometry):
+        #     new_geometry.append(screen_geo[index] + value)
+        #
+
+        new_geometry = self.apply_wallpaper_xy_offset(screen_geo)
+        self.setGeometry(*new_geometry)  # 精准对齐物理屏幕边界
 
         # 更新窗口位置和大小
-        self.win.setWindowTitle(APP_NAME)
-        self.win.show()
-        self.win.raise_()
-        self.win.activateWindow()
+        self.setWindowTitle(APP_NAME)
+        self.show()
+        self.raise_()
+        self.activateWindow()
 
         if not self.config.configget('win_wallpaper_full_screen') and not reset:# and not is_new_windows:
             self.set_as_wallpaper(reset=True) # 似乎新版的不需要再次设置了，但是再次设置一次也无所谓
@@ -943,264 +752,263 @@ class Show(QtCore.QObject):
 
     def set_wallpaper_full_screen(self, checked = None):
         if checked is not None:
-            if self.mouse_state:
+            if self.is_edit_mode:
                 # 禁止在移动模式下更改壁纸模式
-                QMessageBox.warning(self.win, "警告", "请先完成窗口移动，再切换壁纸全屏模式。")
+                QMessageBox.warning(self, "警告", "请先完成窗口移动，再切换壁纸全屏模式。")
                 self.wallpaper_action_fill_screen.setChecked(self.config.configget('win_wallpaper_full_screen'))
                 return
             self.config.configset('win_wallpaper_full_screen', checked)
         if self.config.configget('win_wallpaper'):
             self.set_as_wallpaper()
 
-    def set_wallpaper_offset(self):
-        """壁纸偏移设置窗口"""
-        # 创建配置对话框
-        dialog = QtWidgets.QDialog()
-        dialog.setWindowIcon(QtGui.QIcon(get_res_path("icos/logo.ico")))
-        dialog.setWindowTitle("壁纸模式坐标偏移设置 - 将频谱移到目标显示器后再开壁纸模式，即可指定显示器显示")
-        dialog.setFixedSize(620, 400)
-        dialog.setStyleSheet(style)
-
-
-        # 创建预览画布
-        class PreviewCanvas(QtWidgets.QWidget):
-            def __init__(self, config, parent=None):
-                super().__init__(parent)
-                self.config = config
-                self.setMouseTracking(True)
-
-                # 添加刷新定时器（关键代码）
-                self.refresh_timer = QtCore.QTimer(self)
-                self.refresh_timer.timeout.connect(self._refresh_animation)
-                self.refresh_timer.start(10)  # 30帧/秒
-
-            def paintEvent(self, event):
-                painter = QtGui.QPainter(self)
-                painter.setRenderHint(QtGui.QPainter.Antialiasing)
-
-                # 计算中心矩形区域（占画布60%空间）
-                canvas_size = self.size()
-                rect_width = canvas_size.width() * 0.6 - 20
-                rect_height = canvas_size.height() * 0.6
-                rect_x = (canvas_size.width() - rect_width) / 2
-                rect_y = (canvas_size.height() - rect_height) / 2
-                main_rect = QtCore.QRectF(rect_x, rect_y, rect_width, rect_height)
-
-                # 绘制主矩形
-                painter.setPen(QtGui.QPen(QtGui.QColor(200, 200, 200), 2))
-                painter.drawRect(main_rect)
-
-                # 绘制频谱条形图
-                num_bars = 50  # 条形数量
-                bar_spacing = 2  # 条形间距
-                bar_width = (rect_width - (num_bars - 1) * bar_spacing) / num_bars
-
-                # 生成模拟频谱数据（正弦波叠加）
-                heights = self.generate_spectrum_heights(num_bars, rect_height)
-
-                # 创建渐变效果
-                gradient = QtGui.QLinearGradient(0, main_rect.top(), 0, main_rect.bottom())
-                gradient_color = self.config.configget('gradient_color')
-                if gradient_color:
-                    for item in gradient_color:
-                        gradient.setColorAt(item['y'], QtGui.QColor(*item['color']))
-                else:
-                    top = [255, 233, 233, 190]
-                    btn = [255, 82 , 140, 190]
-                    gradient.setColorAt(0, QtGui.QColor(*top))  # 顶部蓝色
-                    gradient.setColorAt(1, QtGui.QColor(*btn))  # 底部绿色
-
-                # 绘制每个条形
-                for i in range(num_bars):
-                    # 计算条形位置
-                    x = main_rect.left() + i * (bar_width + bar_spacing)
-                    current_height = heights[i] * rect_height * 0.8  # 高度缩放
-
-                    # 创建条形路径
-                    bar_rect = QtCore.QRectF(
-                        x,
-                        main_rect.bottom() - current_height,
-                        bar_width,
-                        current_height
-                    )
-
-                    # 绘制渐变填充条形
-                    painter.fillRect(bar_rect, gradient)
-
-                    # 绘制条形边框
-                    painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 50), 0.5))
-                    painter.drawRect(bar_rect)
-
-                # 左上角十字准星
-                cross_size = 20
-                painter.setPen(QtGui.QPen(QtGui.QColor(255, 120, 180), 2))
-                painter.drawLine(
-                    main_rect.left() - cross_size, main_rect.top(),
-                    main_rect.left() + cross_size, main_rect.top()
-                )
-                painter.drawLine(
-                    main_rect.left(), main_rect.top() - cross_size,
-                    main_rect.left(), main_rect.top() + cross_size
-                )
-
-                # 右下角双向箭头
-                arrow_size = 15
-                # 横向箭头
-                h_arrow = QtCore.QPointF(main_rect.right(), main_rect.bottom() + 30)
-                painter.drawLine(h_arrow.x() - arrow_size, h_arrow.y(),
-                               h_arrow.x() + arrow_size, h_arrow.y())
-                painter.drawPolygon(
-                    QtGui.QPolygonF([
-                        h_arrow + QtCore.QPointF(arrow_size, 0),
-                        h_arrow + QtCore.QPointF(arrow_size/2, -arrow_size/2),
-                        h_arrow + QtCore.QPointF(arrow_size/2, arrow_size/2)
-                    ])
-                )
-                painter.drawPolygon(
-                    QtGui.QPolygonF([
-                        h_arrow + QtCore.QPointF(-arrow_size, 0),  # X轴镜像
-                        h_arrow + QtCore.QPointF(-arrow_size / 2, arrow_size / 2),  # Y轴镜像
-                        h_arrow + QtCore.QPointF(-arrow_size / 2, -arrow_size / 2)  # Y轴镜像
-                    ])
-                )
-
-                # 纵向箭头
-                v_arrow = QtCore.QPointF(main_rect.right() + 30, main_rect.bottom())
-                painter.drawLine(v_arrow.x(), v_arrow.y() - arrow_size,
-                               v_arrow.x(), v_arrow.y() + arrow_size)
-                painter.drawPolygon(
-                    QtGui.QPolygonF([
-                        v_arrow + QtCore.QPointF(0, arrow_size),
-                        v_arrow + QtCore.QPointF(-arrow_size/2, arrow_size/2),
-                        v_arrow + QtCore.QPointF(arrow_size/2, arrow_size/2)
-                    ])
-                )
-                painter.drawPolygon(
-                    QtGui.QPolygonF([
-                        v_arrow + QtCore.QPointF(0, -arrow_size),
-                        v_arrow + QtCore.QPointF(arrow_size/2, -arrow_size/2),
-                        v_arrow + QtCore.QPointF(-arrow_size/2, -arrow_size/2)
-                    ])
-                )
-
-            def generate_spectrum_heights(self, num_bars, max_height):
-                """生成动态频谱高度数据"""
-                import math
-                heights = []
-                timestamp = time.time() * 5  # 时间因子产生动画效果
-
-                # 正弦波叠加算法
-                for i in range(num_bars):
-                    # 基频
-                    base = math.sin(i * 0.3 + timestamp) * 0.5 + 0.5
-
-                    # 高频分量
-                    high_freq = math.sin(i * 2 + timestamp * 2) * 0.2
-
-                    # 低频分量
-                    low_freq = math.sin(i * 0.1 + timestamp * 0.5) * 0.3
-
-
-
-                    # 合成高度值
-                    height = (base * 0.5 + high_freq + low_freq)
-                    height = max(0, min(1.0, height))  # 限制在0-1范围
-
-                    heights.append(height)
-
-                return heights
-            def _refresh_animation(self):
-                """触发界面刷新"""
-                self.update()
-
-        # 创建控件
-        preview = PreviewCanvas(self.config, dialog)
-        preview.setFixedSize(600, 350)
-
-        # 创建输入框
-        input_style = """
-            QSpinBox {
-                min-width: 80px;
-                max-width: 100px;
-                border: 1px solid #00FF00;
-                background: rgba(0,0,0,150);
-                color: #00FF00;
-            }
-        """
-
-        x_input = QtWidgets.QSpinBox(dialog)  # 关键修改：显式设置父对象
-        y_input = QtWidgets.QSpinBox(dialog)
-        w_input = QtWidgets.QSpinBox(dialog)
-        h_input = QtWidgets.QSpinBox(dialog)
-
-        for box in [x_input, y_input, w_input, h_input]:
-            # box.setStyleSheet(input_style)
-            box.setRange(-9999, 9999)
-            box.setSingleStep(1)
-
-        # 初始化数值
-        current_offset = self.config.configget('win_wallpaper_xywh_offset')
-        x_input.setValue(current_offset[0])
-        y_input.setValue(current_offset[1])
-        w_input.setValue(current_offset[2])
-        h_input.setValue(current_offset[3])
-
-        # 布局控件
-        def reposition_inputs():
-            preview_geo = preview.geometry()
-            center = preview_geo.center()
-
-            # X输入框：主矩形上方偏移
-            x_input.move(center.x() - 130, preview_geo.top() + 20)
-            # Y输入框：主矩形左侧偏移
-            y_input.move(preview_geo.left(), center.y() - 60)
-            # W输入框：主矩形下方偏移
-            w_input.move(center.x() + 20, preview_geo.bottom() - 50)
-            # H输入框：主矩形右侧偏移
-            h_input.move(preview_geo.right() - 115, center.y() + 40)
-
-
-
-        # 值变更处理
-        def update_offset():
-            if self.mouse_state:
-                # 禁止在移动模式下更改壁纸模式
-                QMessageBox.warning(self.win, "警告", "请先完成窗口移动，再应用壁纸偏移。")
-                return
-            new_offset = [
-                x_input.value(),
-                y_input.value(),
-                w_input.value(),
-                h_input.value()
-            ]
-            self.config.configset('win_wallpaper_xywh_offset', new_offset)
-            if self.config.configget('win_wallpaper'):
-                self.set_as_wallpaper()
-
-        # 创建确认按钮
-        btn_confirm = QtWidgets.QPushButton("应用")
-        btn_confirm.clicked.connect(update_offset)
-
-        # 窗口显示时重新定位输入框
-        dialog.showEvent = lambda e: reposition_inputs()
-
-        # 主布局
-        layout = QtWidgets.QVBoxLayout(dialog)
-        layout.addWidget(preview)
-        layout.addWidget(btn_confirm)
-
-
-        self.app.setQuitOnLastWindowClosed(False)
-        # 独立事件循环管理
-        loop = QtCore.QEventLoop()
-        dialog.finished.connect(loop.quit)
-        dialog.show()
-        loop.exec_()  # 局部事件循环
-        self.app.setQuitOnLastWindowClosed(True)  # 恢复默认设置
+    # def set_wallpaper_offset(self):
+    #     """壁纸偏移设置窗口"""
+    #     # 创建配置对话框
+    #     dialog = QtWidgets.QDialog()
+    #     dialog.setWindowIcon(QtGui.QIcon(get_res_path("icos/logo.ico")))
+    #     dialog.setWindowTitle("壁纸模式坐标偏移设置 - 将频谱移到目标显示器后再开壁纸模式，即可指定显示器显示")
+    #     dialog.setFixedSize(620, 400)
+    #
+    #
+    #     # 创建预览画布
+    #     class PreviewCanvas(QtWidgets.QWidget):
+    #         def __init__(self, config, parent=None):
+    #             super().__init__(parent)
+    #             self.config = config
+    #             self.setMouseTracking(True)
+    #
+    #             # 添加刷新定时器（关键代码）
+    #             self.refresh_timer = QtCore.QTimer(self)
+    #             self.refresh_timer.timeout.connect(self._refresh_animation)
+    #             self.refresh_timer.start(10)  # 30帧/秒
+    #
+    #         def paintEvent(self, event):
+    #             painter = QtGui.QPainter(self)
+    #             painter.setRenderHint(QtGui.QPainter.Antialiasing)
+    #
+    #             # 计算中心矩形区域（占画布60%空间）
+    #             canvas_size = self.size()
+    #             rect_width = canvas_size.width() * 0.6 - 20
+    #             rect_height = canvas_size.height() * 0.6
+    #             rect_x = (canvas_size.width() - rect_width) / 2
+    #             rect_y = (canvas_size.height() - rect_height) / 2
+    #             main_rect = QtCore.QRectF(rect_x, rect_y, rect_width, rect_height)
+    #
+    #             # 绘制主矩形
+    #             painter.setPen(QtGui.QPen(QtGui.QColor(200, 200, 200), 2))
+    #             painter.drawRect(main_rect)
+    #
+    #             # 绘制频谱条形图
+    #             num_bars = 50  # 条形数量
+    #             bar_spacing = 2  # 条形间距
+    #             bar_width = (rect_width - (num_bars - 1) * bar_spacing) / num_bars
+    #
+    #             # 生成模拟频谱数据（正弦波叠加）
+    #             heights = self.generate_spectrum_heights(num_bars, rect_height)
+    #
+    #             # 创建渐变效果
+    #             gradient = QtGui.QLinearGradient(0, main_rect.top(), 0, main_rect.bottom())
+    #             gradient_color = self.config.configget('gradient_color')
+    #             if gradient_color:
+    #                 for item in gradient_color:
+    #                     gradient.setColorAt(item['pos'], QtGui.QColor(*item['color']))
+    #             else:
+    #                 top = [255, 233, 233, 190]
+    #                 btn = [255, 82 , 140, 190]
+    #                 gradient.setColorAt(0, QtGui.QColor(*top))  # 顶部蓝色
+    #                 gradient.setColorAt(1, QtGui.QColor(*btn))  # 底部绿色
+    #
+    #             # 绘制每个条形
+    #             for i in range(num_bars):
+    #                 # 计算条形位置
+    #                 x = main_rect.left() + i * (bar_width + bar_spacing)
+    #                 current_height = heights[i] * rect_height * 0.8  # 高度缩放
+    #
+    #                 # 创建条形路径
+    #                 bar_rect = QtCore.QRectF(
+    #                     x,
+    #                     main_rect.bottom() - current_height,
+    #                     bar_width,
+    #                     current_height
+    #                 )
+    #
+    #                 # 绘制渐变填充条形
+    #                 painter.fillRect(bar_rect, gradient)
+    #
+    #                 # 绘制条形边框
+    #                 painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 50), 0.5))
+    #                 painter.drawRect(bar_rect)
+    #
+    #             # 左上角十字准星
+    #             cross_size = 20
+    #             painter.setPen(QtGui.QPen(QtGui.QColor(255, 120, 180), 2))
+    #             painter.drawLine(
+    #                 main_rect.left() - cross_size, main_rect.top(),
+    #                 main_rect.left() + cross_size, main_rect.top()
+    #             )
+    #             painter.drawLine(
+    #                 main_rect.left(), main_rect.top() - cross_size,
+    #                 main_rect.left(), main_rect.top() + cross_size
+    #             )
+    #
+    #             # 右下角双向箭头
+    #             arrow_size = 15
+    #             # 横向箭头
+    #             h_arrow = QtCore.QPointF(main_rect.right(), main_rect.bottom() + 30)
+    #             painter.drawLine(h_arrow.x() - arrow_size, h_arrow.y(),
+    #                            h_arrow.x() + arrow_size, h_arrow.y())
+    #             painter.drawPolygon(
+    #                 QtGui.QPolygonF([
+    #                     h_arrow + QtCore.QPointF(arrow_size, 0),
+    #                     h_arrow + QtCore.QPointF(arrow_size/2, -arrow_size/2),
+    #                     h_arrow + QtCore.QPointF(arrow_size/2, arrow_size/2)
+    #                 ])
+    #             )
+    #             painter.drawPolygon(
+    #                 QtGui.QPolygonF([
+    #                     h_arrow + QtCore.QPointF(-arrow_size, 0),  # X轴镜像
+    #                     h_arrow + QtCore.QPointF(-arrow_size / 2, arrow_size / 2),  # Y轴镜像
+    #                     h_arrow + QtCore.QPointF(-arrow_size / 2, -arrow_size / 2)  # Y轴镜像
+    #                 ])
+    #             )
+    #
+    #             # 纵向箭头
+    #             v_arrow = QtCore.QPointF(main_rect.right() + 30, main_rect.bottom())
+    #             painter.drawLine(v_arrow.x(), v_arrow.y() - arrow_size,
+    #                            v_arrow.x(), v_arrow.y() + arrow_size)
+    #             painter.drawPolygon(
+    #                 QtGui.QPolygonF([
+    #                     v_arrow + QtCore.QPointF(0, arrow_size),
+    #                     v_arrow + QtCore.QPointF(-arrow_size/2, arrow_size/2),
+    #                     v_arrow + QtCore.QPointF(arrow_size/2, arrow_size/2)
+    #                 ])
+    #             )
+    #             painter.drawPolygon(
+    #                 QtGui.QPolygonF([
+    #                     v_arrow + QtCore.QPointF(0, -arrow_size),
+    #                     v_arrow + QtCore.QPointF(arrow_size/2, -arrow_size/2),
+    #                     v_arrow + QtCore.QPointF(-arrow_size/2, -arrow_size/2)
+    #                 ])
+    #             )
+    #
+    #         def generate_spectrum_heights(self, num_bars, max_height):
+    #             """生成动态频谱高度数据"""
+    #             import math
+    #             heights = []
+    #             timestamp = time.time() * 5  # 时间因子产生动画效果
+    #
+    #             # 正弦波叠加算法
+    #             for i in range(num_bars):
+    #                 # 基频
+    #                 base = math.sin(i * 0.3 + timestamp) * 0.5 + 0.5
+    #
+    #                 # 高频分量
+    #                 high_freq = math.sin(i * 2 + timestamp * 2) * 0.2
+    #
+    #                 # 低频分量
+    #                 low_freq = math.sin(i * 0.1 + timestamp * 0.5) * 0.3
+    #
+    #
+    #
+    #                 # 合成高度值
+    #                 height = (base * 0.5 + high_freq + low_freq)
+    #                 height = max(0, min(1.0, height))  # 限制在0-1范围
+    #
+    #                 heights.append(height)
+    #
+    #             return heights
+    #         def _refresh_animation(self):
+    #             """触发界面刷新"""
+    #             self.update()
+    #
+    #     # 创建控件
+    #     preview = PreviewCanvas(self.config, dialog)
+    #     preview.setFixedSize(600, 350)
+    #
+    #     # 创建输入框
+    #     input_style = """
+    #         QSpinBox {
+    #             min-width: 80px;
+    #             max-width: 100px;
+    #             border: 1px solid #00FF00;
+    #             background: rgba(0,0,0,150);
+    #             color: #00FF00;
+    #         }
+    #     """
+    #
+    #     x_input = QtWidgets.QSpinBox(dialog)  # 关键修改：显式设置父对象
+    #     y_input = QtWidgets.QSpinBox(dialog)
+    #     w_input = QtWidgets.QSpinBox(dialog)
+    #     h_input = QtWidgets.QSpinBox(dialog)
+    #
+    #     for box in [x_input, y_input, w_input, h_input]:
+    #         # box.setStyleSheet(input_style)
+    #         box.setRange(-9999, 9999)
+    #         box.setSingleStep(1)
+    #
+    #     # 初始化数值
+    #     current_offset = self.config.configget('win_wallpaper_xywh_offset')
+    #     x_input.setValue(current_offset[0])
+    #     y_input.setValue(current_offset[1])
+    #     w_input.setValue(current_offset[2])
+    #     h_input.setValue(current_offset[3])
+    #
+    #     # 布局控件
+    #     def reposition_inputs():
+    #         preview_geo = preview.geometry()
+    #         center = preview_geo.center()
+    #
+    #         # X输入框：主矩形上方偏移
+    #         x_input.move(center.x() - 130, preview_geo.top() + 20)
+    #         # Y输入框：主矩形左侧偏移
+    #         y_input.move(preview_geo.left(), center.y() - 60)
+    #         # W输入框：主矩形下方偏移
+    #         w_input.move(center.x() + 20, preview_geo.bottom() - 50)
+    #         # H输入框：主矩形右侧偏移
+    #         h_input.move(preview_geo.right() - 115, center.y() + 40)
+    #
+    #
+    #
+    #     # 值变更处理
+    #     def update_offset():
+    #         if self.is_edit_mode:
+    #             # 禁止在移动模式下更改壁纸模式
+    #             QMessageBox.warning(self, "警告", "请先完成窗口移动，再应用壁纸偏移。")
+    #             return
+    #         new_offset = [
+    #             x_input.value(),
+    #             y_input.value(),
+    #             w_input.value(),
+    #             h_input.value()
+    #         ]
+    #         self.config.configset('win_wallpaper_xywh_offset', new_offset)
+    #         if self.config.configget('win_wallpaper'):
+    #             self.set_as_wallpaper()
+    #
+    #     # 创建确认按钮
+    #     btn_confirm = QtWidgets.QPushButton("应用")
+    #     btn_confirm.clicked.connect(update_offset)
+    #
+    #     # 窗口显示时重新定位输入框
+    #     dialog.showEvent = lambda e: reposition_inputs()
+    #
+    #     # 主布局
+    #     layout = QtWidgets.QVBoxLayout(dialog)
+    #     layout.addWidget(preview)
+    #     layout.addWidget(btn_confirm)
+    #
+    #
+    #     # self.app.setQuitOnLastWindowClosed(False)
+    #     # 独立事件循环管理
+    #     loop = QtCore.QEventLoop()
+    #     dialog.finished.connect(loop.quit)
+    #     dialog.show()
+    #     loop.exec_()  # 局部事件循环
+    #     # self.app.setQuitOnLastWindowClosed(True)  # 恢复默认设置
 
     def set_windows_bottom(self):
         """置窗口在屏幕底部"""
-        window = self.win.windowHandle()
+        window = self.windowHandle()
         if window:
             # 定义Windows API常量
             HWND_BOTTOM = wintypes.HWND(1)  # 关键修正：正确类型转换
@@ -1220,72 +1028,6 @@ class Show(QtCore.QObject):
             )
     def tray_activated(self, reason):
         """托盘图标激活事件"""
-        if reason == QtWidgets.QSystemTrayIcon.DoubleClick:
-            # 双击托盘图标显示/隐藏窗口
-            if self.win.isVisible():
-                self.win.hide()
-            else:
-                self.win.show()
-                self.win.raise_()
-                self.win.activateWindow()
-
-    def show_visual_prompt(self, message, duration=2000):
-        """在窗口中央显示可视化提示"""
-        try:
-            # 创建提示标签（关键修改：使用独立窗口）
-            self.prompt_label = QtWidgets.QLabel()
-
-            # 必须设置的窗口标志（关键修复1）
-            self.prompt_label.setWindowFlags(
-                QtCore.Qt.ToolTip |
-                QtCore.Qt.FramelessWindowHint |
-                QtCore.Qt.WindowStaysOnTopHint |
-                QtCore.Qt.WindowTransparentForInput |  # 透明化输入
-                QtCore.Qt.WindowDoesNotAcceptFocus
-            )
-
-            # 透明背景设置（关键修复2）
-            self.prompt_label.setAttribute(QtCore.Qt.WA_TranslucentBackground)
-
-            # 设置醒目的文字样式（调整颜色对比度）
-            self.prompt_label.setStyleSheet("""
-                QLabel {
-                    color: pink;
-                    font: bold 28px;
-                    background-color: rgba(0, 0, 0, 180);
-                    border-radius: 15px;
-                    padding: 20px;
-                }
-            """)
-
-            self.prompt_label.setAlignment(QtCore.Qt.AlignCenter)
-            self.prompt_label.setText(message)
-            self.prompt_label.adjustSize()
-
-            # 定位到主窗口中心（关键修复3）
-            main_geo = self.win.geometry()
-            self.prompt_label.move(
-                main_geo.center().x() - self.prompt_label.width()//2,
-                main_geo.center().y() - self.prompt_label.height()//2
-            )
-
-            # 必须先show后启动动画（关键修复4）
-            self.prompt_label.show()
-
-            # 动画设置
-            self.animation = QtCore.QPropertyAnimation(self.prompt_label, b"windowOpacity")
-            self.animation.setDuration(1000)
-            self.animation.setStartValue(1.0)
-            self.animation.setEndValue(0.0)
-
-            # 定时器链式调用（关键修复5）
-            QtCore.QTimer.singleShot(duration - 1000, lambda:
-                self.animation.start()
-            )
-            QtCore.QTimer.singleShot(duration, lambda: (
-                self.prompt_label.deleteLater(),
-                self.prompt_label.close()
-            ))
-        except Exception as e:
-            traceback.print_exc()
-            print(f"可视化提示异常：{e}")
+        if reason != QtWidgets.QSystemTrayIcon.ActivationReason.Trigger:
+            return
+        self.open_main_win.put(None)

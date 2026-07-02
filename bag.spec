@@ -5,7 +5,7 @@ bag_name='小娥频谱显示安装包'
 
 
 
-dic = 'E:/sound_line/dist/app/'
+dic = 'E:/sound_line_2/dist/app/'
 
 a = Analysis(
     ['bag.py'],
@@ -42,5 +42,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     uac_admin=True,
-    icon=f'{dic}/icos/logo.ico',
+    icon=f'{dic}_internal/icos/logo.ico',
 )

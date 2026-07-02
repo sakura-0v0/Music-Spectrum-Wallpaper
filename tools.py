@@ -3,7 +3,7 @@ import sys
 import threading
 import time
 import win_precise_time as wps
-from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume
+from pycaw.pycaw import AudioUtilities
 import pythoncom
 import ctypes
 
@@ -14,33 +14,13 @@ def get_default_playback_id():
     try:
         # 获取默认音频端点
         devices = AudioUtilities.GetSpeakers()
-        return devices.GetId()
+        return devices.id
     except Exception as e:
         print(f"音频API访问失败: {str(e)}")
         return None
     finally:
         pythoncom.CoUninitialize()
 
-
-def restart(quit_queue):
-    """重启"""
-    print(f"{[sys.executable] + sys.argv}")
-    subprocess.Popen([sys.executable] + sys.argv)
-
-    quit_queue.put(None) # 通知show窗口退出，完成整个进程的退出
-    print("重启成功" ,"xxxxxxxxxxxx"*100)
-    time.sleep(1)
-    # os._exit(0)
-    # sys.exit(0)
-
-
-def check_restart(restart_queue, quit_queue):
-    """检测子进程的重启请求"""
-    def func():
-        msg = restart_queue.get()
-        # if msg == 'restart':
-        restart(quit_queue)
-    threading.Thread(target=func, daemon=True).start()
 
 
 def truncate_fast(value: float, decimals=3):

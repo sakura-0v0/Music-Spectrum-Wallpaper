@@ -1,43 +1,37 @@
 # FFT处理进程
 import multiprocessing
+import sys
 import traceback
 import numpy as np
 from scipy.interpolate import CubicSpline
 
-fft_in_left_queue = multiprocessing.JoinableQueue()
-# fft_out_left_queue = multiprocessing.Queue()
-# fft_in_right_queue = multiprocessing.Queue()
-# fft_out_right_queue = multiprocessing.Queue()
-# fft_in_left_queue, fft_out_left_queue= multiprocessing.Queue()
-# fft_in_right_queue, fft_out_right_queue = multiprocessing.Queue()
 
 
-def run_fft_process():
+
+def run_fft_process(
+        fft_in_left_queue,
+        left_volume_value,
+        right_volume_value,
+):
     """启动FFT处理进程"""
     fft_process_left = multiprocessing.Process(
         target=fft_process_loop,
         name="FFT 左",
         args=(
             fft_in_left_queue,
-            # fft_out_left_queue
+            left_volume_value,
+            right_volume_value,
         ),
-        daemon=True
     )
 
-    # fft_process_right = multiprocessing.Process(
-    #     target=fft_process_loop,
-    #     args=(fft_in_right_queue, fft_out_right_queue),
-    #     name="FFT 右",
-    #     daemon=True
-    # )
 
     fft_process_left.start()
-    # time.sleep(0.2)
-    # fft_process_right.start()
+    return fft_process_left
 
 def fft_process_loop(
         fft_in_queue,
-        # fft_out_queue
+        left_volume_value,
+        right_volume_value,
 ):
     """FFT处理进程"""
     while True:
@@ -46,7 +40,15 @@ def fft_process_loop(
             if event is None:
                 break
             data, event = event
+            # 新增音量计算代码（在FFT处理前）
+            max_amplitude = 32767.0  # 16bit有符号整型最大值
+            left_rms = np.sqrt(np.mean(data[0] ** 2))
+            left_percent = left_rms / max_amplitude * 143.88
 
+            right_rms = np.sqrt(np.mean(data[1] ** 2))
+            right_percent = right_rms / max_amplitude * 143.88
+
+            # print(f"当前音量(L): {left_percent:.1f}% | (R): {right_percent:.1f}%")
             # 执行FFT
             left_fft = fft(data[0], **event)
             right_fft = fft(data[1], **event)
@@ -56,16 +58,20 @@ def fft_process_loop(
             # 进行FFT后处理，并将结果放入显示队列
             update_fft_data(
                 middle_fft,
+                left_percent,
+                right_percent,
+                left_volume_value,
+                right_volume_value,
                 **event
             )
-
         except Exception as e:
             traceback.print_exc()
         finally:
             fft_in_queue.task_done()
         #     fft_out_queue.put(result)
 
-    print('quit_fft_process-------------------')
+    print('quit_process_fft-------------------')
+    # sys.exit(0)
 
 
 def fft(
@@ -133,8 +139,14 @@ def fft(
     return target_energy
 
 middle_fft_data_list = [] # 用于存放滑动窗口的FFT数据
+left_volume_history = []
+right_volume_history = []
 def update_fft_data(
     middle_fft,
+    left_percent,
+    right_percent,
+    left_volume_value,
+    right_volume_value,
     target_freqs,
     window_beta,
     target_rate,
@@ -143,28 +155,54 @@ def update_fft_data(
     alpha,
     max_alpha,
     data_pipe,
+
 ):
     global middle_fft_data_list
-    middle_fft_data_list.append(middle_fft)
-    c = len(middle_fft_data_list) - fft_window_size
-    if c > 0:
-        # print(len(self.middle_fft_data_list) , self.max_ftt_list_len)
-        middle_fft_data_list = middle_fft_data_list[c:]
+    # 新增：音量历史数据存储
+    global left_volume_history, right_volume_history  # 新增全局变量
 
-    current_data = middle_fft_data_list[-1]  # 提取最新数据
-    # 计算滑动窗口均值
-    window = middle_fft_data_list#[-fft_window_size:]
-    weights = alpha ** np.arange(len(window))[::-1]
-    a_middle = np.average(window, axis=0, weights=weights)
-    # magnitude_array = 20 * np.log10(
-    #     np.maximum(a_middle * 0.5, current_data) + 1e-10
-    # )
-    magnitude_array = 20 * np.log10(
-        a_middle + 1e-10
+    # 抽象核心算法为局部函数
+    def process_smoothing(history_list, new_value, window_size, alpha, axis=None):
+        """统一处理滑动窗口维护和平滑值计算"""
+        # 1. 添加新值
+        history_list.append(new_value)
+
+        # 2. 维护窗口长度
+        if len(history_list) > window_size:
+            history_list = history_list[-window_size:]
+
+        # 3. 计算加权平均
+        weights = alpha ** np.arange(len(history_list))[::-1]
+        smoothed = np.average(history_list, axis=axis, weights=weights)
+
+        return history_list, smoothed
+
+    # ==== 音量处理 ====
+
+    # 左声道处理
+    left_volume_history, smooth_left = process_smoothing(
+        left_volume_history, left_percent, fft_window_size, alpha
     )
-    data_array = 20 * max_alpha * np.log10(
-        np.maximum(current_data, 0) + 1e-10
+
+    # 右声道处理
+    right_volume_history, smooth_right = process_smoothing(
+        right_volume_history, right_percent, fft_window_size, alpha
     )
-    magnitudes = np.maximum(magnitude_array, data_array)  # 转换为列表后批量添加
+
+    # 更新共享变量
+    left_volume_value.value = max(smooth_left, left_percent * max_alpha)
+    right_volume_value.value = max(smooth_right, right_percent * max_alpha)
+
+    # ==== FFT数据处理 ====
+    # 中间频谱处理（复用相同算法）
+    middle_fft_data_list, a_middle = process_smoothing(
+        middle_fft_data_list, middle_fft, fft_window_size, alpha, axis=0
+    )
+
+    # ==== 后续处理保持原样 ====
+    current_data = middle_fft_data_list[-1]
+    magnitude_array = 20 * np.log10(a_middle + 1e-10)
+    data_array = 20 * max_alpha * np.log10(np.maximum(current_data, 0) + 1e-10)
+    magnitudes = np.maximum(magnitude_array, data_array)
     data_pipe.send(magnitudes)
     data_pipe.recv()

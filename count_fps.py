@@ -7,13 +7,18 @@ class CountFpsShare:
     FPS计数器的管理中心，
     用于统一管理FPS计数器的共享变量
     """
-    share_fps = {}
+    share_fps: dict[str, Value] = {}
     @classmethod
     def print_fps(cls):
         print('===================== FPS =========')
         for name, value in cls.share_fps.items():
             print(f"{name}: {value.value}FPS")
         print('===================================')
+
+    @classmethod
+    def quit_all_fps(cls):
+        for name, value in cls.share_fps.items():
+            value.value = -1
 
     print_fps_threading_quit: bool = False
 
@@ -74,7 +79,11 @@ class CountFps:
     def _loop(self):
         while True:
             self.fps = self.update_count
+            if self.share_fps.value <= -1:
+                break
             self.share_fps.value = self.fps
             self.update_count = 0
             # print(f"{self.name}: {self.fps}FPS")
             time.sleep(1)
+
+        print(f"{self.name} CountFps Quit")

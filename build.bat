@@ -1,28 +1,30 @@
 
 :: ================= 配置区 =================
-set "icospath=E:\sound_line\"
+set "icospath=E:\sound_line_2\"
 set "appname=小娥频谱显示"
-set "PRO_SPEC=run.spec"
-set "SIGN=E:\sound_line\"
+set "PRO_SPEC=run.spec"123020029
+
+set "SIGN=E:\sound_line_2\证书"
 set "BAG_ROOT=E:\app_bag"
+set "SIGN_PASS=123020029"
+set "conda_env=sound_line_2"
 
 
 echo =========打包项目==========
-call activate sound_line3.7
-call cd /d E:\sound_line
+call activate %conda_env%
+call cd /d E:\sound_line_2
 call pyinstaller --noconfirm --clean %PRO_SPEC%
 echo =========打包项目完成！==========
 
 timeout /t 2 /nobreak >nul
 echo =========签名程序==========
-set "text=123456"
+set "text=%SIGN_PASS%"
 powershell -Command "Add-Type -AssemblyName System.Windows.Forms; [Windows.Forms.Clipboard]::SetText(\"%text%\")"
 echo 文本已复制到剪贴板！
 
-call cd /d "E:\sound_line\dist\app"
+call cd /d "%icospath%dist\app"
 start "" /B cscript //nologo "E:\oem_icos\paste_at_3s.vbs"
-call E:\app_bag\dist\signcode.exe -spc "%SIGN%证书.cer" -v "%SIGN%证书.pvk" -n "%appname%" -t "http://tsa.starfieldtech.com" -p "%text%" %appname%.exe
-
+call E:\app_bag\dist\signcode.exe -spc "%SIGN%.cer" -v "%SIGN%.pvk" -n "%appname%" -t "http://tsa.starfieldtech.com" "%icospath%dist\app\%appname%.exe"
 echo =========签名程序完成！==========
 
 
@@ -50,14 +52,13 @@ echo =========制作安装包完成！==========
 timeout /t 2 /nobreak >nul
 echo =========签名安装包======123456
 ====
-set "text=123456"
+set "text=%SIGN_PASS%"
 powershell -Command "Add-Type -AssemblyName System.Windows.Forms; [Windows.Forms.Clipboard]::SetText(\"%text%\")"
 echo 文本已复制到剪贴板！
 
 call cd /d "E:\app_bag\dist"
 start "" /B cscript //nologo "E:\oem_icos\paste_at_3s.vbs"
-call signcode.exe -spc "%SIGN%证书.cer" -v "%SIGN%证书.pvk" -n "%appname%" -t http://tsa.starfieldtech.com "%appname%安装包.exe"
-
+call signcode.exe -spc "%SIGN%.cer" -v "%SIGN%.pvk" -n "%appname%" -t http://tsa.starfieldtech.com "%appname%安装包.exe"
 echo =========签名安装包完成！==========
 pause
 cmd /k

@@ -1,14 +1,21 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+import sys
+# 👇 新增：动态获取 xiaoe_ui 库的安装路径
+import xiaoe_ui
+xiaoe_ui_path = os.path.dirname(xiaoe_ui.__file__)
 
 block_cipher = None
-
 
 a = Analysis(
     ['run.py'],
     pathex=[],
     binaries=[],
-    datas=[('icos', 'icos')],
+    datas=[
+    ('icos', 'icos'),
+    (xiaoe_ui_path, 'xiaoe_ui'),
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -19,6 +26,8 @@ a = Analysis(
     cipher=block_cipher,
     noarchive=False,
 )
+
+
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(
