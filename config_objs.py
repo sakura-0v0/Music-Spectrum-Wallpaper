@@ -2,7 +2,7 @@ import os
 
 from xiaoe_ui import StyleEngine, ConfigBridge
 
-from config import Config
+from xiaoe_config_manager import Config
 
 CONFIG_ROOT = "config_file"
 os.makedirs(CONFIG_ROOT, exist_ok=True)

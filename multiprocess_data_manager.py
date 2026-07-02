@@ -1,17 +1,12 @@
 import multiprocessing
 import subprocess
 import threading
-from typing import TYPE_CHECKING, Callable
+from typing import Callable
 
-from xiaoe_ui import run_in_main_block
-
-from config import ConfigInMainProcessPipe
+from xiaoe_config_manager import ConfigInMainProcessPipe
 from config_objs import config_manager
 from count_fps import CountFpsShare
-from pl_manager import PlManager
 
-if TYPE_CHECKING:
-    from run import Main
 
 class MultiProcessDataManager:
     """进程管理中心，必须在主进程中实例化"""

@@ -11,10 +11,9 @@ from PySide6.QtWidgets import QApplication
 from xiaoe_ui import StyleEngine, resolve_static, WinManager
 from xiaoe_ui.utils.to_china_text import to_china_text
 
-from config import ConfigInMainProcessPipe, ConfigInChildProcessPipe
+from xiaoe_config_manager import ConfigInMainProcessPipe, ConfigInChildProcessPipe
 from config_objs import engine, theme_cfg, config_manager
 from config_ui.main_win import App
-from count_fps import CountFpsShare
 from driver import SoundDriver
 from fft_process import run_fft_process
 from multiprocess_data_manager import MultiProcessDataManager, kill_process
