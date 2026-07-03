@@ -9,12 +9,12 @@ os.makedirs(CONFIG_ROOT, exist_ok=True)
 DEFAULT_CONFIG = {
     # 窗口设置(已在系统托盘提供开关)
     'is_locked':True,
-    'win_top': False,
-    'win_wallpaper': False,
+    'win_top': True,
+    'win_wallpaper': True,
     'win_wallpaper_full_screen': False,
     'win_wallpaper_xywh_offset': (0,0,0,0),
     'win_size': (1000, 450),
-    'win_xy': (),
+    'win_xy': (200,200),
 
     # 插帧开关(现在基本上没用了)
     'hight_fps' : False,# (无需重启)
