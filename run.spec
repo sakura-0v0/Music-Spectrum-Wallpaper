@@ -14,7 +14,9 @@ a = Analysis(
     binaries=[],
     datas=[
     ('icos', 'icos'),
-    (xiaoe_ui_path, 'xiaoe_ui'),
+    (f'{xiaoe_ui_path}/static', 'xiaoe_ui/static'),
+    (f'{xiaoe_ui_path}/demo_static', 'xiaoe_ui/demo_static'),
+    (f'{xiaoe_ui_path}/theme/global_style.qss', 'xiaoe_ui/theme'),
     ],
     hiddenimports=[],
     hookspath=[],

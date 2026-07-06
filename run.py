@@ -1,5 +1,6 @@
 import multiprocessing
 import os
+os.environ["QT_FONT_DPI"] = "96"
 import subprocess
 import sys
 import traceback

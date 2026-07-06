@@ -13,7 +13,7 @@ from PySide6 import QtWidgets, QtGui, QtCore
 from PySide6.QtCore import QTimer, Signal, QRect
 from PySide6.QtGui import QAction, QGuiApplication
 from PySide6.QtWidgets import QMessageBox, QVBoxLayout
-from xiaoe_ui import FramelessWin, WallpaperWinMixin
+from xiaoe_ui import FramelessWin, WallpaperWinMixin, FramelessWinOpenGL
 
 from app_info import APP_NAME
 from count_fps import CountFps
@@ -72,7 +72,7 @@ class GetColor:
 
 
 
-class Show(WallpaperWinMixin, FramelessWin):
+class Show(WallpaperWinMixin, FramelessWinOpenGL):
     quit_signal = Signal()
     def __init__(
             self,
