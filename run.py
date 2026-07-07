@@ -1,18 +1,16 @@
 import multiprocessing
 import os
 os.environ["QT_FONT_DPI"] = "96"
-import subprocess
 import sys
 import traceback
-from importlib import resources
 from threading import Thread
 
 import numpy as np
 from PySide6.QtWidgets import QApplication
-from xiaoe_ui import StyleEngine, resolve_static, WinManager
+from xiaoe_ui import resolve_static, WinManager
 from xiaoe_ui.utils.to_china_text import to_china_text
 
-from xiaoe_config_manager import ConfigInMainProcessPipe, ConfigInChildProcessPipe
+from xiaoe_config_manager import ConfigInChildProcessPipe
 from config_objs import engine, theme_cfg, config_manager
 from config_ui.main_win import App
 from driver import SoundDriver
