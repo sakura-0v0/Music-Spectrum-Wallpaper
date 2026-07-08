@@ -22,4 +22,4 @@ six==1.17.0
 win-precise-time==1.4.2
 xiaoe-keyboard==6.0.1
 xiaoe-config-manager==1.0.1
-./xiaoe_ui-1.1.0-py3-none-any.whl
+./xiaoe_ui-1.2.7-py3-none-any.whl
