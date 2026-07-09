@@ -24,7 +24,7 @@ class Main:
     def __init__(self):
 
         self.app = QApplication(sys.argv)
-        to_china_text(self.app)
+        to_china_text(self.app, "translations")
         load_app_skin()
         self.multiprocess_datas = MultiProcessDataManager(
             start_processes = self.start_processes,

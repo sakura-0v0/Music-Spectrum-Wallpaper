@@ -4,7 +4,8 @@ import os
 import sys
 # 👇 新增：动态获取 xiaoe_ui 库的安装路径
 import xiaoe_ui
-xiaoe_ui_path = os.path.dirname(xiaoe_ui.__file__)
+xiaoe_ui_datas = xiaoe_ui.get_static_files_to_spec()
+trans_datas = xiaoe_ui.get_china_qm_file_list_map_to_spec()
 
 block_cipher = None
 
@@ -13,10 +14,9 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[
-    ('icos', 'icos'),
-    (f'{xiaoe_ui_path}/static', 'xiaoe_ui/static'),
-    (f'{xiaoe_ui_path}/demo_static', 'xiaoe_ui/demo_static'),
-    (f'{xiaoe_ui_path}/theme/global_style.qss', 'xiaoe_ui/theme'),
+        ('icos', 'icos'),
+        *xiaoe_ui_datas,
+        *trans_datas,
     ],
     hiddenimports=[],
     hookspath=[],
