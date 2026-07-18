@@ -20,6 +20,6 @@ setuptools==82.0.1
 shiboken6==6.11.1
 six==1.17.0
 win-precise-time==1.4.2
-xiaoe-keyboard==6.0.1
+xiaoe-keyboard
 xiaoe-config-manager==1.0.1
 ./xiaoe_ui-1.4.3-py3-none-any.whl
