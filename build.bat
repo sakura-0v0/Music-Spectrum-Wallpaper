@@ -2,7 +2,7 @@
 :: ================= 配置区 =================
 set "icospath=E:\sound_line_2\"
 set "appname=小娥频谱显示"
-set "PRO_SPEC=run.spec"123020029
+set "PRO_SPEC=run.spec"
 
 set "SIGN=E:\sound_line_2\证书"
 set "BAG_ROOT=E:\app_bag"
