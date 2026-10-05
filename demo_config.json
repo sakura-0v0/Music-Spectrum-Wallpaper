@@ -1,0 +1,5 @@
+{
+    "app_name": "myapp",
+    "timeout": 60,
+    "debug": true
+}

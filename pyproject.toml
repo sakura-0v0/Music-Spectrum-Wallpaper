@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xiaoe-config-manager"
+version = "2.0.2"
+description = "多进程安全的 JSON 配置文件管理器，支持默认配置、动态重置与进程间自动同步"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.8"
+keywords = ["config", "configuration", "json", "multiprocess", "thread-safe"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "pytest>=8.3.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/xiaoe/xiaoe-config-manager"
+Repository = "https://github.com/xiaoe/xiaoe-config-manager"
+
+[tool.setuptools]
+packages = ["xiaoe_config_manager"]
