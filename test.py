@@ -1,8 +1,8 @@
 """
-xiaoe_config_manager 完整测试套件（按 demo.py 的共享声明模式写）
+xiaoe_config_manager 完整测试套件（按共享声明模式写）
 
 模式：
-    class AppConfigP:                          # 纯声明，不继承任何东西
+    class AppConfigP(ConfigKeysBase):         # 纯声明类，继承 ConfigKeysBase
         app_name = default("myapp")
         ...
 
@@ -20,9 +20,12 @@ import pytest
 
 from xiaoe_config_manager import (
     Config,
+    ConfigApi,
     ConfigItemProxy,
     ConfigInMainProcessPipe,
     ConfigInChildProcessPipe,
+    ConfigKeysBase,
+    ConfigMemory,
     default,
 )
 
@@ -31,7 +34,7 @@ from xiaoe_config_manager import (
 # 共享配置声明（主/子进程共用）
 # ===========================================================================
 
-class AppConfigP:
+class AppConfigP(ConfigKeysBase):
     """纯声明：只放默认值，供主进程和子进程分别继承。"""
     app_name = default("myapp")
     timeout = default(30)
@@ -345,11 +348,17 @@ def _child_snapshot(set_q, get_q, ready_evt, result_q):
         cfg.close()
 
 
-def _child_get_all_raw(set_q, get_q, ready_evt, result_q):
+def _child_get_all_snapshot(set_q, get_q, ready_evt, result_q):
     cfg = _make_child_config(set_q, get_q)
     ready_evt.set()
     try:
-        result_q.put(cfg.configget("all"))
+        snapshot = cfg.get("all")
+        snapshot["app_name"] = "被改坏"          # 改副本
+        result_q.put({
+            "is_dict": isinstance(snapshot, dict),
+            "snapshot": snapshot,
+            "cache_untouched": cfg.get("app_name") == "myapp",
+        })
     finally:
         cfg.close()
 
@@ -488,15 +497,20 @@ class TestChildReads:
             "id_list": None,
         }
 
-    def test_child_get_all_is_none_known_behavior(self, main_pair):
-        """子进程 configget('all') 不返回整份配置（已知行为，返回 None）。"""
+    def test_child_get_all_is_local_snapshot(self, main_pair):
+        """子进程 get('all') = 本地那份完整配置的快照（副本身，改了不影响缓存）。
+
+        本地缓存本来就是主进程广播过来的整份配置，所以"取整份"不需要走队列 ——
+        和 ConfigMemory._read_all 同一件事。按 "all" 枚举键的检测（keys.orphans）
+        在子进程里因此也能用。
+        """
         cfg, pipe = main_pair
         set_q, get_q = pipe.get_queues()
         ready = multiprocessing.Event()
         result_q = multiprocessing.Queue()
 
         p = multiprocessing.Process(
-            target=_child_get_all_raw, args=(set_q, get_q, ready, result_q)
+            target=_child_get_all_snapshot, args=(set_q, get_q, ready, result_q)
         )
         p.start()
         try:
@@ -505,7 +519,17 @@ class TestChildReads:
         finally:
             p.join(timeout=10)
 
-        assert result is None
+        assert p.exitcode == 0
+        assert result["is_dict"] is True
+        assert result["snapshot"] == {
+            "app_name": "被改坏",
+            "timeout": 30,
+            "debug": False,
+            "id_list": None,
+        }
+        assert result["cache_untouched"] is True
+        # 主进程那份没被副本影响
+        assert cfg.get("app_name") == "myapp"
 
 
 # ===========================================================================
@@ -730,3 +754,400 @@ class TestLifecycle:
             assert p.exitcode == 0
         finally:
             pipe.close()
+
+
+# ===========================================================================
+# 内存版：标准做法是定义类（与文件版对称），memory() 只是便捷路径
+# ===========================================================================
+
+class AppMemory(ConfigMemory, AppConfigP):
+    """内存版的标准写法：基类换成 ConfigMemory，声明照旧多继承。"""
+
+
+class TestMemoryByClass:
+    def test_no_args_uses_declared_defaults(self):
+        mem = AppMemory()
+        assert mem.DEFAULTS == AppConfigP.DEFAULTS
+        assert mem.app_name.get() == "myapp"
+        assert mem.timeout.get() == 30
+        assert mem.debug.get() is False
+
+    def test_dict_overrides_declared_defaults(self):
+        mem = AppMemory({"timeout": 7, "extra": "x"})
+        assert mem.timeout.get() == 7
+        assert mem.app_name.get() == "myapp"     # 没被覆盖的仍然来自声明
+        assert mem.get("extra") == "x"
+
+    def test_no_file_and_interfaces_match(self):
+        mem = AppMemory()
+        assert mem.fname is None                 # 不落盘
+        assert isinstance(mem, ConfigApi)
+        assert isinstance(mem.get("all"), dict)
+
+    def test_set_reset_and_subscribe(self):
+        mem = AppMemory()
+        hits = []
+        mem.on("timeout", lambda v: hits.append(("on", v)))
+        mem.timeout.set(60)
+        assert mem.timeout.get() == 60
+        assert ("on", 60) in hits
+        mem.timeout.reset()
+        assert mem.timeout.get() == 30           # reset 回到声明默认值
+
+    def test_missing_key_raises_like_file_backend(self):
+        mem = AppMemory()
+        with pytest.raises(KeyError):
+            mem.get("nope")                      # 与文件版一致，不搞特殊
+        with pytest.raises(KeyError):
+            mem.reset("nope")                    # 默认值里没有就没法重置
+
+    def test_memory_classmethod_still_works(self):
+        mem = AppMemory.memory({"timeout": 5})
+        assert mem.timeout.get() == 5
+        assert AppConfig.memory({"timeout": 6}).timeout.get() == 6
+        assert ConfigMemory({"x": 1}).get("x") == 1
+
+
+# ===========================================================================
+# 订阅：注销 + 派发隔离
+# ===========================================================================
+
+class TestSubscription:
+    def test_off_value_changed_stops_delivery(self, cfg):
+        hits = []
+
+        def cb(key, value):
+            hits.append((key, value))
+
+        cfg.value_changed(cb)
+        cfg.set("timeout", 11)
+        cfg.off_value_changed(cb)
+        cfg.set("timeout", 12)
+        assert hits == [("timeout", 11)]
+
+    def test_off_value_changed_twice_raises(self, cfg):
+        def cb(key, value):
+            pass
+
+        cfg.value_changed(cb)
+        cfg.off_value_changed(cb)
+        with pytest.raises(ValueError):
+            cfg.off_value_changed(cb)            # 注销没注册过的回调不静默
+
+    def test_off_value_changed_unregistered_raises(self, cfg):
+        with pytest.raises(ValueError):
+            cfg.off_value_changed(lambda key, value: None)
+
+    def test_per_key_listener_exception_is_isolated(self, cfg, capsys):
+        hits = []
+
+        def boom(value):
+            raise RuntimeError("单键回调炸了")
+
+        cfg.on("timeout", boom)
+        cfg.on("timeout", lambda value: hits.append(value))
+
+        cfg.set("timeout", 42)                   # 不该抛出去
+        assert hits == [42]                      # 后面的回调照常跑
+        assert cfg.get("timeout") == 42          # 值也确实写进去了
+        assert "单键回调炸了" in capsys.readouterr().err
+
+    def test_value_listener_exception_is_isolated(self, cfg, capsys):
+        hits = []
+
+        def boom(key, value):
+            raise RuntimeError("全键回调炸了")
+
+        cfg.value_changed(boom)
+        cfg.value_changed(lambda key, value: hits.append((key, value)))
+
+        cfg.set("timeout", 43)
+        assert hits == [("timeout", 43)]
+        assert "全键回调炸了" in capsys.readouterr().err
+
+    def test_reset_also_survives_listener_exception(self, cfg):
+        cfg.on("timeout", lambda value: 1 / 0)
+        cfg.reset("timeout")                     # 不该抛
+        assert cfg.get("timeout") == 30          # AppConfigP 里的声明默认值
+
+    def test_listener_exception_without_stderr_is_still_isolated(self, cfg, monkeypatch):
+        import sys as _sys
+        hits = []
+        monkeypatch.setattr(_sys, "stderr", None)     # 模拟 console=False 的打包环境
+        cfg.on("timeout", lambda value: 1 / 0)
+        cfg.on("timeout", lambda value: hits.append(value))
+        cfg.set("timeout", 44)
+        assert hits == [44]
+# ===========================================================================
+# 补丁 1：文件损坏与权限
+# ===========================================================================
+class TestFileCorruption:
+    def test_invalid_json_falls_back_to_defaults(self, workdir):
+        with open("broken.json", "w", encoding="utf-8") as f:
+            f.write("{invalid_json")
+        # 期望：要么抛异常，要么降级到默认值（取决于你的设计意图，测试应记录当前行为）
+        with pytest.raises(json.JSONDecodeError):
+            AppConfig(file_name="broken")
+
+# ===========================================================================
+# 补丁 2：不可序列化对象跨进程
+# ===========================================================================
+def _child_set_unpicklable(set_q, get_q, ready_evt, result_q):
+    cfg = _make_child_config(set_q, get_q)
+    ready_evt.set()
+    try:
+        cfg.id_list.set(object())  # 不可 Pickle
+        result_q.put("ok")
+    except Exception as e:
+        result_q.put(type(e).__name__)
+    finally:
+        cfg.close()
+
+
+# ===========================================================================
+# 补丁 2（修正版）：不可序列化对象跨进程
+# ===========================================================================
+
+def _child_set_unpicklable(set_q, get_q, ready_evt, result_q):
+    cfg = _make_child_config(set_q, get_q)
+    ready_evt.set()
+    try:
+        # lambda 无法被 pickle —— 这才是真正的“不可序列化”
+        cfg.id_list.set(lambda x: x)
+        # 给后台 _feed 线程一点时间尝试 pickle 并失败
+        time.sleep(1.0)
+        # 子进程依然存活
+        result_q.put("survived")
+    finally:
+        cfg.close()
+
+
+class TestSerializationEdge:
+    def test_unpicklable_does_not_crash_and_is_discarded(self, main_pair):
+        cfg, pipe = main_pair
+        set_q, get_q = pipe.get_queues()
+        ready = multiprocessing.Event()
+        result_q = multiprocessing.Queue()
+
+        p = multiprocessing.Process(
+            target=_child_set_unpicklable, args=(set_q, get_q, ready, result_q)
+        )
+        p.start()
+        try:
+            assert ready.wait(timeout=10)
+            # 子进程应当成功存活并返回 "survived"，而不是直接崩溃
+            result = result_q.get(timeout=10)
+            assert result == "survived"
+        finally:
+            p.join(timeout=10)
+
+        # 核心断言：不可序列化的值被丢弃，主进程配置未被修改
+        # 初始默认值是 None，所以这里应该依然是 None
+        assert cfg.id_list.get() is None
+
+# ===========================================================================
+# 补丁 3：并发写入竞态（粗略版）
+# ===========================================================================
+def _child_concurrent_set(set_q, get_q, ready_evt, result_q, key, value, count):
+    cfg = _make_child_config(set_q, get_q)
+    ready_evt.set()
+    try:
+        for _ in range(count):
+            cfg.configset(key, value)
+        result_q.put("done")
+    finally:
+        cfg.close()
+
+class TestConcurrency:
+    def test_concurrent_writes_no_crash(self, main_pair):
+        cfg, pipe = main_pair
+        set_q, get_q = pipe.get_queues()
+        ready = multiprocessing.Event()
+        result_q = multiprocessing.Queue()
+        p = multiprocessing.Process(
+            target=_child_concurrent_set,
+            args=(set_q, get_q, ready, result_q, "timeout", 99, 50),
+        )
+        p.start()
+        try:
+            assert ready.wait(timeout=10)
+            # 主进程也同时写
+            for _ in range(50):
+                cfg.configset("timeout", 100)
+            result_q.get(timeout=10)
+        finally:
+            p.join(timeout=10)
+        # 不断言最终值（因为竞态结果不确定），只断言不崩溃、最终值合法
+        assert cfg.timeout.get() in (99, 100)
+
+
+# ===========================================================================
+# 补丁 4：值的边界 —— 读出来、写进去都是深拷贝（嵌套结构不共享）
+# ===========================================================================
+
+class NestedKeys(ConfigKeysBase):
+    """带嵌套默认值的声明：一个 list 里套 dict 再套 list。"""
+    rows = default([{"n": [1]}])
+    plain = default(0)
+
+
+class NestedMem(ConfigMemory, NestedKeys):
+    ...
+
+
+class NestedFile(Config, NestedKeys):
+    ...
+
+
+def _child_nested_copy_check(set_q, get_q, ready_evt, result_q):
+    """在子进程里验证：读出来的嵌套值改不动本地缓存。"""
+    cfg = _make_child_config(set_q, get_q)
+    ready_evt.set()
+    try:
+        got = cfg.id_list.get()
+        got[0]["n"].append(999)              # 改读出来的副本
+        result_q.put({
+            "after_mutating_copy": cfg.id_list.get(),
+            "get_all_is_copy": _mutate_all_and_read_back(cfg),
+        })
+    finally:
+        cfg.close()
+
+
+def _mutate_all_and_read_back(cfg):
+    """改 get('all') 拿到的嵌套值，返回缓存里真正的值。"""
+    whole = cfg.get("all")
+    whole["id_list"][0]["n"].append(888)
+    return cfg.id_list.get()
+
+
+class TestValueIsolation:
+    """配置对象不与调用方共享可变对象（嵌套 list / dict 也一样）。"""
+
+    def test_file_read_returns_deep_copy(self, cfg):
+        cfg.set("id_list", [{"n": [1]}])
+        got = cfg.id_list.get()
+        got[0]["n"].append(2)
+        assert cfg.id_list.get() == [{"n": [1]}]
+
+    def test_file_write_stores_deep_copy(self, cfg):
+        src = [{"n": [1]}]
+        cfg.set("id_list", src)
+        src[0]["n"].append(2)                 # 改调用方那个对象
+        assert cfg.id_list.get() == [{"n": [1]}]
+
+    def test_file_get_all_is_deep_copy(self, cfg):
+        cfg.set("id_list", [{"n": [1]}])
+        whole = cfg.get("all")
+        whole["id_list"][0]["n"].append(2)
+        assert cfg.id_list.get() == [{"n": [1]}]
+
+    def test_memory_read_returns_deep_copy(self):
+        mem = NestedMem()
+        got = mem.rows.get()
+        got[0]["n"].append(2)
+        assert mem.rows.get() == [{"n": [1]}]
+
+    def test_memory_write_stores_deep_copy(self):
+        mem = NestedMem()
+        src = [{"n": [1]}]
+        mem.rows.set(src)
+        src[0]["n"].append(2)
+        assert mem.rows.get() == [{"n": [1]}]
+
+    def test_memory_get_all_is_deep_copy(self):
+        mem = NestedMem()
+        whole = mem.get("all")
+        whole["rows"][0]["n"].append(2)
+        assert mem.rows.get() == [{"n": [1]}]
+
+    def test_declared_default_is_not_shared_between_instances(self):
+        """类声明的嵌套默认值不能被实例改串（连 DEFAULTS 本身也不能被改到）。"""
+        a, b = NestedMem(), NestedMem()
+        a.default_config["rows"][0]["n"].append(99)
+        assert NestedKeys.DEFAULTS["rows"] == [{"n": [1]}]
+        assert b.default_config["rows"] == [{"n": [1]}]
+        assert b.rows.get() == [{"n": [1]}]
+
+    def test_constructor_data_is_not_shared_with_caller(self):
+        src = {"rows": [{"n": [1]}]}
+        mem = NestedMem(src)
+        src["rows"][0]["n"].append(2)
+        assert mem.rows.get() == [{"n": [1]}]
+
+    def test_reset_target_is_not_shared_with_config(self):
+        """reset 之后 config 与 default_config 里那份嵌套对象也得是两份。"""
+        mem = NestedMem()
+        mem.set("rows", [{"n": [5]}])
+        mem.reset("rows")
+        mem.config["rows"][0]["n"].append(7)          # 直接改内部那份
+        assert mem.default_config["rows"] == [{"n": [1]}]
+
+    def test_file_roundtrip_reload_keeps_nesting(self, workdir):
+        """落盘再读回来，嵌套结构仍然是独立的（JSON 语义不变，只是不再共享）。"""
+        cfg = NestedFile(file_name="nested")
+        cfg.set("rows", [{"n": [1, 2]}])
+        whole = cfg.get("all")
+        assert whole["rows"] == [{"n": [1, 2]}]
+        whole["rows"][0]["n"].append(3)
+        assert cfg.rows.get() == [{"n": [1, 2]}]
+
+    def test_child_reads_return_deep_copy(self, main_pair):
+        cfg, pipe = main_pair
+        cfg.set("id_list", [{"n": [1]}])
+        set_q, get_q = pipe.get_queues()
+        ready = multiprocessing.Event()
+        result_q = multiprocessing.Queue()
+
+        p = multiprocessing.Process(
+            target=_child_nested_copy_check, args=(set_q, get_q, ready, result_q)
+        )
+        p.start()
+        try:
+            assert ready.wait(timeout=10)
+            result = result_q.get(timeout=10)
+        finally:
+            p.join(timeout=10)
+
+        assert p.exitcode == 0
+        assert result["after_mutating_copy"] == [{"n": [1]}]
+        assert result["get_all_is_copy"] == [{"n": [1]}]
+        # 主进程那份也没被影响
+        assert cfg.id_list.get() == [{"n": [1]}]
+
+
+# ===========================================================================
+# 补丁 5：'all' 是保留键名（get / reset 用它，写它报错）
+# ===========================================================================
+
+class TestAllIsReserved:
+    def test_declaring_all_raises(self):
+        with pytest.raises(TypeError) as exc:
+            type("BadAllKeys", (ConfigKeysBase,), {"all": default(1)})
+        assert "all" in str(exc.value)
+
+    def test_undeclared_all_is_fine(self):
+        """没声明它，get('all') / reset('all') 照旧可用。"""
+        mem = NestedMem()
+        mem.set("plain", 5)
+        assert mem.get("all")["plain"] == 5
+        mem.reset("all")
+        assert mem.get("all")["plain"] == 0
+
+    def test_set_all_raises_instead_of_writing_dead_key(self, cfg):
+        with pytest.raises(TypeError):
+            cfg.set("all", {"app_name": "x"})
+        # 没写进去任何东西
+        assert "all" not in cfg.get("all")
+
+    def test_old_name_and_proxy_also_blocked(self, cfg):
+        with pytest.raises(TypeError):
+            cfg.configset("all", {"app_name": "x"})
+        with pytest.raises(TypeError):
+            cfg.item("all").set({"app_name": "x"})
+
+    def test_get_all_and_reset_all_still_work(self, cfg):
+        cfg.set("app_name", "x")
+        assert cfg.get("all")["app_name"] == "x"
+        cfg.reset("all")
+        assert cfg.get("all")["app_name"] == "myapp"

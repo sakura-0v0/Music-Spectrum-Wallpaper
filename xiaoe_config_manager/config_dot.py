@@ -1,108 +1,415 @@
-from typing import Generic, TypeVar, overload, Any, Optional
+"""声明式配置 —— 键名与默认值写在类里，实例上用点操作。
+
+三样东西，各管一段：
+
+* :class:`ConfigKeysBase` —— 纯声明基类。子类只放「键名 = 默认值」，
+  算出 ``DEFAULTS`` 供别处消费（后端、子进程、纯 Python 一侧都读同一份）。
+* :class:`ConfigDeclareMixin` —— 在纯声明之上，把每个键做成实例上的 property，
+  ``cfg.speed`` 返回 :class:`ConfigItemProxy`。:class:`ConfigBase` 继承本类。
+* :class:`ConfigItemProxy` —— 点操作代理。它只认 owner 的
+  ``get`` / ``set`` / ``reset`` / ``on`` / ``off``，所以点操作和直接调配置对象
+  走的是同一条路（派发、信号、跨线程投递全都一致）。
+
+声明来源只有一处，规则是明确的：
+
+1. 键只认 :class:`ConfigKeysBase` 的子类（以及实现类自己的类体）；
+   后端类（``Config`` / ``ConfigMemory`` / 管道）的类字典一律不扫。
+2. 默认值必须是 :data:`DATA_TYPES` 里的数据 —— 函数、property、``QMetaObject``
+   之类不是配置项。
+3. 键名不许撞 :data:`RESERVED_KEYS`，也不许撞实现类上已有的任何属性
+   （动态判定）—— 命中直接 :class:`TypeError`，不静默。
+4. 一条继承链上不准出现同名键（``class Child(AppKeys)`` 里再写一遍 ``app_name``）；
+   兄弟基类同名按 Python 的 MRO 走（左边的赢）。
+
+用法::
+
+    from xiaoe_config_manager import Config, ConfigKeysBase, default
+
+    class AppKeys(ConfigKeysBase):
+        app_name = default("myapp")
+        timeout  = default(30)
+
+    class AppConfig(Config, AppKeys):
+        ...
+
+    cfg = AppConfig("config_files/app")
+    cfg.app_name.get()        # 'myapp'
+    cfg.timeout.set(60)       # 走 AppConfig.set → 落盘 + 派发通知
+"""
+
+from __future__ import annotations
+
+from typing import Any, Callable, Generic, TypeVar, overload
+
+__all__ = [
+    "DATA_TYPES",
+    "RESERVED_KEYS",
+    "ConfigKeysBase",
+    "ConfigDeclareMixin",
+    "ConfigItemProxy",
+    "collect_defaults",
+    "default",
+]
 
 T = TypeVar("T")
 
-def _make_proxy_property(key: str) -> property:
-    def getter(self) -> "ConfigItemProxy":
-        return self._get_config_proxy(key)
-    return property(getter, doc=f"配置项 {key!r}")
+#: 允许当默认值的类型。默认值最终要进 JSON（或内存 dict）、要能跨进程 pickle，
+#: 所以只认这些。故意不含 ``set``：它过得了这里的校验，却会让 ``json.dump``
+#: 在文件被截断之后失败 —— 那是「配置全丢」的起点（见 README 的故障链一节）。
+#: ``tuple`` 保留，但写进 JSON 会退化成 ``list``（读回来是 list）。
+DATA_TYPES = (str, int, float, bool, list, dict, tuple, type(None))
+
+#: 不许当配置键的名字。
+#:
+#: 这里只列动态判定看不到的那些 —— 也就是实现类在 ``__init__`` 里赋的实例属性
+#: （类字典里没有它们），以及几个语义特殊的名字。方法是动态判定的，不用抄进来。
+RESERVED_KEYS = frozenset({
+    "DEFAULTS",
+    # 声明层 / 代理层自己的
+    "item",
+    "keys",
+    "instance",
+    "memory",
+    "persist",
+    # 后端实现类的实例属性（ConfigBase / Config 的 __init__ 里赋的）
+    "config",
+    "fname",
+    "queues",
+    "config_lock",
+    "default_config",
+    "default_config_callback",
+    # 子进程管道自己的实例属性
+    "config_set_queue",
+    "config_get_queue",
+    # 订阅接口名（manager 侧是方法，桥侧是 Qt 信号）
+    "value_changed",
+    # get / set / reset 把它当特殊键名：get('all') 读整份、reset('all') 重置整份、
+    # set('all', ...) 直接报错。声明它就等于声明一个永远读不到的键（cfg.all.get()
+    # 拿到的是整份配置），所以不允许。
+    "all",
+})
 
 
+@overload
+def default(value: T) -> "ConfigItemProxy[T]": ...
 
-class ConfigDeclareMixin:
-    """让子类通过类属性声明配置键。
 
-        class AppConfig(Config):
-            app_name = "aaaaa"              # 运行时可用
-            # 或
-            app_name: ConfigItemProxy = "aaaaa"   # IDE 有提示
+@overload
+def default(value: None, type_: Any) -> "ConfigItemProxy[Any]": ...
 
-        cfg = AppConfig(file_name='aaaa')
-        cfg.app_name.get()   # "aaaaa"
+
+def default(value: Any = None, type_: Any = None) -> Any:
+    """声明一个配置项的默认值。
+
+    运行时就是返回原值 —— 它只为两件事存在：给 IDE 提供类型
+    （``default(30)`` 推断成 ``ConfigItemProxy[int]``、``default(None, list)``
+    推断成 ``ConfigItemProxy[list | None]``），以及让声明读起来有语义。
+
+    ::
+
+        class AppKeys(ConfigKeysBase):
+            timeout = default(30)            # -> ConfigItemProxy[int]
+            id_list = default(None, list)    # -> ConfigItemProxy[list | None]
+
+    Args:
+        value: 默认值本身（运行时原样返回）。
+        type_: 只在 ``value is None`` 时用来给 IDE 标类型，运行时不用。
+
+    Returns:
+        传入的 ``value``。
     """
-    DEFAULTS: dict = {}
+    return value
 
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
 
-        defaults = {}
-        seen = set()
+# ══════════════════════════════════════════════════════════════
+# 扫描
+# ══════════════════════════════════════════════════════════════
 
-        # 先收集继承来的 DEFAULTS（父类已经处理成 property 的）
-        for base in reversed(cls.__mro__[1:]):
+def _declared_in(cls: type) -> dict:
+    """扫出 ``cls`` 自己类体里声明的键（不含继承来的）。
+
+    Args:
+        cls: 要扫描的类。
+
+    Returns:
+        ``{键名: 默认值}``。
+    """
+    out: dict = {}
+    for attr, value in list(vars(cls).items()):
+        if attr.startswith("_") or attr == "DEFAULTS":
+            continue
+        if isinstance(value, (property, staticmethod, classmethod)):
+            continue
+        if not isinstance(value, DATA_TYPES):
+            continue
+        out[attr] = value
+    return out
+
+
+def _check_inheritance_conflict(cls: type, own: dict) -> None:
+    """拦「一条继承链上出现同名键」。
+
+    只拦 :class:`ConfigKeysBase` 这条线里的重名（``class Child(AppKeys)`` 又写了一遍
+    ``app_name``）—— 这正是「到底哪份默认值生效」讲不清的来源。
+
+    兄弟基类同名不拦（保持 Python 的 MRO 行为：左边赢）。
+
+    Args:
+        cls: 要检查的类。
+        own: :func:`_declared_in` 算出来的「自己类体里声明的键」。
+
+    Raises:
+        TypeError: 继承链上出现同名键。
+    """
+    inherited: dict = {}
+    for base in cls.__mro__[1:]:
+        if not isinstance(base, type) or not issubclass(base, ConfigKeysBase):
+            continue
+        for name in getattr(base, "_own_declared", None) or {}:
+            inherited.setdefault(name, base)
+
+    dup = sorted(set(own) & set(inherited))
+    if not dup:
+        return
+    detail = "、".join(f"{name}（已在 {inherited[name].__name__} 里声明）" for name in dup)
+    raise TypeError(
+        f"{cls.__name__} 重复声明了继承链上已有的配置键：{detail}。"
+        f"同一个键只能在一处声明 —— 要改默认值请改父类那一行，或者换个键名。"
+    )
+
+
+def _check_reserved(cls: type, keys: dict) -> None:
+    """拦「键名砸掉框架自己的属性」：先查显式清单，再动态查实现类。
+
+    Args:
+        cls: 要检查的类。
+        keys: 待检查的 ``{键名: 默认值}``。
+
+    Raises:
+        TypeError: 命中保留字，或撞上实现类已有的属性名。
+    """
+    bad = set(keys) & RESERVED_KEYS
+
+    for name in keys:
+        if name in bad:
+            continue
+        for base in cls.__mro__[1:]:
             if base is object:
                 continue
-            for k, v in (base.__dict__.get("DEFAULTS") or {}).items():
-                defaults.setdefault(k, v)
+            if isinstance(base, type) and issubclass(base, ConfigKeysBase):
+                continue                     # 声明类自己的键，不算撞
+            if name in vars(base):
+                bad.add(name)
+                break
 
-        # 再扫 MRO 上每个类自己的 __dict__
-        for base in cls.__mro__:
-            if base is object or base is ConfigDeclareMixin:
+    if bad:
+        raise TypeError(
+            f"{cls.__name__} 里这些名字不能当配置键（会砸掉配置对象自己的属性，"
+            f"或者是 get / set / reset 的特殊键名）：{sorted(bad)}。"
+            f"改个名字；没声明的普通键可以走 cfg.item('键名')，特殊键名（如 'all'）不行。"
+        )
+
+
+def collect_defaults(cls: type) -> dict:
+    """扫出 ``cls`` 认哪些配置键、默认值各是多少。
+
+    扫描来源（后面的覆盖前面的）：
+
+    1. MRO 上各基类的 ``DEFAULTS``（MRO 正序，所以近的 / 左边的先占位）；
+    2. ``cls`` 自己类体里声明的；
+    3. MRO 上的纯声明基类（:class:`ConfigKeysBase` 的子类，且不在
+       :class:`ConfigDeclareMixin` 那条线上）里声明的。
+
+    实现类（``Config`` / ``ConfigMemory`` / 管道 / Qt 桥）以及 ``object`` 的类字典
+    不扫 —— 换句话说，"哪里能写默认值"是明确的。
+
+    Args:
+        cls: 要扫描的类。
+
+    Returns:
+        ``{键名: 默认值}``；没有声明就是空 dict。
+
+    Raises:
+        TypeError: 声明了保留字，或继承链上出现同名键。
+    """
+    out: dict = {}
+
+    # ① 继承来的 DEFAULTS
+    for base in cls.__mro__[1:]:
+        if base is object:
+            continue
+        for key, value in (base.__dict__.get("DEFAULTS") or {}).items():
+            out.setdefault(key, value)
+
+    # ② + ③ 扫声明来源
+    for base in reversed(cls.__mro__):
+        if base is object or base is ConfigKeysBase:
+            continue
+        if base is not cls:
+            if not (isinstance(base, type) and issubclass(base, ConfigKeysBase)):
                 continue
-            for attr, default in list(vars(base).items()):
-                if attr.startswith("_") or attr == "DEFAULTS" or attr in seen:
-                    continue
-                if callable(default) or isinstance(
-                        default, (property, staticmethod, classmethod)
-                ):
-                    continue
-                seen.add(attr)
-                defaults[attr] = default
+            if issubclass(base, ConfigDeclareMixin):
+                continue                     # 实现类的类字典不扫
+        for attr, value in list(vars(base).items()):
+            if attr.startswith("_") or attr == "DEFAULTS":
+                continue
+            if isinstance(value, (property, staticmethod, classmethod)):
+                continue
+            if not isinstance(value, DATA_TYPES):
+                continue
+            out[attr] = value
 
-        # 只把 property 设在当前 cls 上，不动父类
-        for k in seen:
-            setattr(cls, k, _make_proxy_property(k))
+    _check_reserved(cls, out)
+    return out
 
-        cls.DEFAULTS = defaults
 
-    def _get_config_proxy(self, key: str) -> "ConfigItemProxy":
+# ══════════════════════════════════════════════════════════════
+# 声明 / 点操作
+# ══════════════════════════════════════════════════════════════
+
+class ConfigKeysBase:
+    """纯声明基类：子类只放「键名 = 默认值」，算出 ``DEFAULTS``，不生成点操作。
+
+    "一份声明、多处消费"就靠它 —— 后端、子进程、纯 Python 一侧读的都是
+    :attr:`DEFAULTS` 这个普通 dict::
+
+        class AppKeys(ConfigKeysBase):
+            app_name = default("myapp")
+
+        AppKeys.DEFAULTS                                # {'app_name': 'myapp'}
+        Config(path, default_config=AppKeys.DEFAULTS)   # 非声明式消费
+        class AppConfig(Config, AppKeys): ...           # 声明式消费（顺带有点操作）
+
+    规则见模块 docstring。
+    """
+
+    #: 本类认得的键与默认值（由 ``__init_subclass__`` 算好）
+    DEFAULTS: dict = {}
+
+    #: 本类自己类体里声明的键（不含继承来的）—— 重名检查要用
+    _own_declared: dict = {}
+
+    def __init_subclass__(cls, **kwargs):
+        """子类创建时算出 ``DEFAULTS``（顺带做重名与保留字检查）。
+
+        Args:
+            **kwargs: 类关键字参数，原样转给父类。
+        """
+        super().__init_subclass__(**kwargs)
+        own = _declared_in(cls)
+        _check_inheritance_conflict(cls, own)
+        cls._own_declared = own
+        cls.DEFAULTS = collect_defaults(cls)
+
+
+def _proxy_property(key: str) -> property:
+    """把声明键变成类上的 property，实例访问得到 :class:`ConfigItemProxy`。"""
+    return property(
+        lambda self: self._item(key),
+        doc=f"配置项 {key!r} —— .get() / .set(v) / .reset() / .on(cb)",
+    )
+
+
+class ConfigDeclareMixin(ConfigKeysBase):
+    """在 :class:`ConfigKeysBase` 之上，把每个声明键做成实例上的点操作属性。
+
+    :class:`ConfigBase` 继承本类，于是 ``Config`` / ``ConfigMemory`` / 管道以及
+    用户的 ``AppConfig(Config, AppKeys)`` 全都有点操作。
+    """
+
+    def __init_subclass__(cls, **kwargs):
+        """子类创建时把声明的键装成实例上的 property。
+
+        Args:
+            **kwargs: 类关键字参数，原样转给父类。
+        """
+        super().__init_subclass__(**kwargs)          # → 先把 DEFAULTS 算好
+        for key in cls.DEFAULTS:
+            setattr(cls, key, _proxy_property(key))
+
+    def _item(self, key: str) -> "ConfigItemProxy":
+        """按 key 取（并缓存）配置项代理。声明键的 property 走这里。
+
+        Args:
+            key: 配置键名。
+
+        Returns:
+            该键的 :class:`ConfigItemProxy`（同一个键永远返回同一个对象）。
+        """
         cache = self.__dict__.setdefault("_config_proxies", {})
         if key not in cache:
             cache[key] = ConfigItemProxy(self, key)
         return cache[key]
 
+    def item(self, key: str) -> "ConfigItemProxy":
+        """显式取一个配置项代理：``cfg.item("speed").set(60)``。
+
+        声明的键可以直接 ``cfg.speed``；没声明的键（以及撞了保留字的键）
+        走这条。
+
+        Args:
+            key: 配置键名。
+
+        Returns:
+            该键的 :class:`ConfigItemProxy`。
+        """
+        return self._item(key)
+
+
 class ConfigItemProxy(Generic[T]):
-    """配置项代理：`config.xxx.get/set/reset()`。"""
+    """一个配置项：``cfg.speed.get() / .set(60) / .reset() / .on(cb)``。
 
-    __slots__ = ("_config", "_key")
+    不能手工 new —— 从 ``cfg.键名`` 或 ``cfg.item("键名")`` 拿。
 
-    def __init__(self, config: "ConfigApi", key: str):
-        self._config = config
+    它只转发给 owner 的 ``get`` / ``set`` / ``reset`` / ``on`` / ``off``，
+    所以「点操作」和「直接调配置对象」是同一条路：落盘、广播、派发、Qt 信号
+    全都照常。
+    """
+
+    __slots__ = ("_owner", "_key")
+
+    def __init__(self, owner: Any, key: str):
+        """不要自己 new —— 从 ``cfg.键名`` 或 ``cfg.item("键名")`` 拿。
+
+        Args:
+            owner: 配置对象（点操作全部转发给它）。
+            key: 配置键名。
+        """
+        self._owner = owner
         self._key = key
 
     def get(self) -> T:
-        """
-        获取该配置的值
-        """
-        return self._config.configget(self._key)
+        """读这个配置项当前的值。"""
+        return self._owner.get(self._key)
 
     def set(self, value: T) -> None:
-        """
-        更改该配置的值
-        """
-        self._config.configset(self._key, value)
+        """写这个配置项（落盘 / 广播 / 派发通知都由 owner 负责）。"""
+        self._owner.set(self._key, value)
 
     def reset(self) -> None:
+        """把这个配置项恢复成默认值。"""
+        self._owner.reset(self._key)
+
+    def on(self, callback: Callable[[T], None]) -> None:
+        """监听这个配置项的变化，等价于 ``owner.on(键名, callback)``。
+
+        Args:
+            callback: ``(new_value) -> None``。
         """
-        重置该配置的值
+        self._owner.on(self._key, callback)
+
+    def off(self, callback: Callable[[T], None]) -> None:
+        """取消监听（必须是 :meth:`on` 传进去的同一个函数引用）。
+
+        Args:
+            callback: 之前注册的那个函数引用。
         """
-        self._config.configreset(self._key)
+        self._owner.off(self._key, callback)
+
+    @property
+    def key(self) -> str:
+        """配置键名（``"speed"`` 这种字符串）。"""
+        return self._key
 
     def __repr__(self) -> str:
         return f"<ConfigItemProxy {self._key!r}>"
-
-
-@overload
-def default(value: T) -> "ConfigItemProxy[T]": ...
-@overload
-def default(value: None, type_: "type[T] | T") -> "ConfigItemProxy[T | None]": ...
-
-
-def default(value: Any = None, type_: Any = None) -> Any:
-    """声明配置项的默认值。
-
-    两种写法：
-        timeout = default(30)            # 自动推断 ConfigItemProxy[int]
-        id_list = default(None, list)    # 显式: ConfigItemProxy[list | None]
-    """
-    return value
