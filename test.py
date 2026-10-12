@@ -14,6 +14,9 @@ xiaoe_config_manager 完整测试套件（按共享声明模式写）
 """
 import json
 import multiprocessing
+import os
+import random
+import threading
 import time
 
 import pytest
@@ -125,6 +128,7 @@ class TestDotSet:
 
     def test_set_persists_to_file(self, cfg):
         cfg.app_name.set("persisted")
+        cfg.flush() # 新版本延迟落盘文件不会立刻更改。
         with open("demo_config.json", encoding="utf-8") as f:
             data = json.load(f)
         assert data["app_name"] == "persisted"
@@ -132,6 +136,7 @@ class TestDotSet:
     def test_set_visible_across_instances(self, workdir):
         c1 = AppConfig(file_name="shared")
         c1.timeout.set(99)
+        c1.flush() # 新版本延迟落盘文件不会立刻更改。
         c2 = AppConfig(file_name="shared")
         assert c2.timeout.get() == 99
 
@@ -140,6 +145,15 @@ class TestDotSet:
         assert cfg.id_list.get() == [1, 1, 1]
         cfg.debug.set(True)
         assert cfg.debug.get() is True
+
+    def test_high_set_value(self, cfg):
+
+        def set_worker():
+            for i in range(1000):
+                cfg.app_name.set(str(i))
+        for _ in range(200):
+            threading.Thread(target=set_worker).start()
+
 
 
 class TestDotReset:
@@ -277,6 +291,7 @@ class TestLegacyGet:
 class TestLegacySetReset:
     def test_set_persists(self, cfg):
         cfg.configset("app_name", "1.2.3.4")
+        cfg.flush() # 新版本延迟落盘文件不会立刻更改。
         with open("demo_config.json", encoding="utf-8") as f:
             data = json.load(f)
         assert data["app_name"] == "1.2.3.4"
@@ -1151,3 +1166,141 @@ class TestAllIsReserved:
         assert cfg.get("all")["app_name"] == "x"
         cfg.reset("all")
         assert cfg.get("all")["app_name"] == "myapp"
+
+"""暴力测试：多线程 / 多实例 / 多进程 一起写，验证不崩且文件始终合法。
+
+多实例写同一文件必然互相覆盖（每个实例独立 self.config），所以断言只查：
+* 不抛 WinError 32/5 到调用方；
+* 文件在任意时刻都是**合法 JSON**（原子写保证，不会被截成半截）；
+* 最后文件里是**某个写者的完整快照**，不是半份拼凑。
+"""
+
+class BigKeys(ConfigKeysBase):
+    a = default(0)
+    b = default(0)
+    c = default(0)
+    blob = default("x" * 500)
+
+
+class BigConfig(Config, BigKeys):
+    pass
+
+
+# ────────────────────────────────────────────────────────────
+# 工具
+# ────────────────────────────────────────────────────────────
+
+def _load(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _is_valid(path):
+    try:
+        _load(path)
+        return True
+    except (json.JSONDecodeError, FileNotFoundError, PermissionError):
+        return False
+
+
+# ────────────────────────────────────────────────────────────
+# 1. 同实例、多线程：所有键都写，最后文件该是完整最终值
+# ────────────────────────────────────────────────────────────
+
+class TestSameInstanceManyThreads:
+
+    def test_parallel_set_no_crash_and_file_valid(self, tmp_path):
+        cfg = BigConfig(str(tmp_path / "same"), save_delay=0.05)
+        errors = []
+
+        def worker(tid):
+            try:
+                for i in range(2000):
+                    cfg.set(f"a", tid * 100000 + i)
+                    if i % 7 == 0:
+                        cfg.set("blob", f"{tid}-{i}-" + "y" * 400)
+            except Exception as e:                # noqa: BLE001
+                errors.append((tid, repr(e)))
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors, errors
+        cfg.flush()
+
+        data = _load(cfg.path)
+        # 文件合法 + 四个键都在 + a 是某个线程写过的值
+        assert set(data) >= {"a", "b", "c", "blob"}
+        assert isinstance(data["a"], int)
+        assert isinstance(data["blob"], str) and len(data["blob"]) >= 400
+
+
+# ────────────────────────────────────────────────────────────
+# 2. 多实例、多线程：互相覆盖，但文件永远合法、永不崩
+# ────────────────────────────────────────────────────────────
+
+class TestManyInstancesManyThreads:
+
+    def test_chaos_no_crash_file_always_valid(self, tmp_path):
+        path = str(tmp_path / "chaos")
+        n_inst = 6
+        n_thread = 4
+        per = 800
+
+        insts = [BigConfig(path, save_delay=0.02) for _ in range(n_inst)]
+        errors = []
+        stop = threading.Event()
+
+        # 后台校验线程：随机时间点读文件，必须永远是合法 JSON
+        corruption = []
+
+        def validator():
+            while not stop.is_set():
+                if os.path.exists(path + ".json"):
+                    try:
+                        _load(path + ".json")
+                    except json.JSONDecodeError as e:
+                        corruption.append(repr(e))
+                    except (FileNotFoundError, PermissionError):
+                        pass  # 正在 replace 的瞬间，忽略
+                time.sleep(0.001)
+
+        v = threading.Thread(target=validator, daemon=True)
+        v.start()
+
+        def worker(inst, tid):
+            try:
+                for i in range(per):
+                    inst.set("a", random.randint(0, 10**9))
+                    inst.set("b", random.randint(0, 10**9))
+                    if i % 5 == 0:
+                        inst.set("c", random.randint(0, 10**9))
+            except Exception as e:                # noqa: BLE001
+                errors.append((id(inst), tid, repr(e)))
+
+        threads = []
+        for inst in insts:
+            for t in range(n_thread):
+                th = threading.Thread(target=worker, args=(inst, t))
+                threads.append(th)
+                th.start()
+        for th in threads:
+            th.join()
+
+        stop.set()
+        v.join(timeout=2)
+
+        # 全部实例 flush，最后一把落盘
+        for inst in insts:
+            inst.flush()
+
+        assert not errors, errors
+        assert not corruption, corruption
+
+        # 最终文件必须合法，且键齐全
+        data = _load(path + ".json")
+        assert set(data) >= {"a", "b", "c", "blob"}
+

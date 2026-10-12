@@ -15,6 +15,7 @@
 - **线程安全** — 内置线程锁，单进程多线程环境下安全读写
 - **多进程安全** — 通过 `multiprocessing.Queue` 双向管道实现主进程与子进程之间的配置自动同步
 - **变更通知自动** — 本进程写当场派发；跨进程写按逐键 diff 派发；自己的回声被 diff 吞掉，不会双发
+- **延迟落盘** — `set` 只改内存并重置定时器（默认 0.5s），窗口内多次写只落盘一次；`reset` / `get('all')` / `flush()` / 进程正常退出都会强制把待写数据落到磁盘
 - **数据安全** — 配置文件损坏时**原样抛异常、绝不覆盖**；落盘是原子写（写 `.tmp` 再 `os.replace`）
 - **值不共享** — 读出来、写进去的都是**深拷贝**（嵌套的 list / dict 也一样）：配置里的对象永远不会被外部改到，外部对象也不会被配置改到
 - **点操作 API** — `cfg.app_name.get() / .set(v) / .reset()`，配合 `ConfigItemProxy[T]` 提供完整静态类型检查
@@ -73,6 +74,7 @@ cfg.timeout.set(60)         # 修改并写文件
 cfg.timeout.get()           # 60
 cfg.timeout.reset()         # 恢复默认
 cfg.timeout.get()           # 30
+cfg.flush()                 # 立刻把待落盘的改动写出（不等到定时器到点）
 
 # 标准三件套
 cfg.set("timeout", 60)
@@ -275,16 +277,52 @@ Config("app", default_config={"a": 1})
 > 为什么这么严：以前这里把坏文件吞成空配置，紧接着 `__init__` 用默认值补缺并
 > `_save()` 落盘 —— 用户原来的配置**永久消失，且没有任何提示**。报错比静默丢数据好。
 
-### 2. 落盘是原子写
+### 2. 落盘是延迟 + 原子写
 
-`_save()` 先写 `<file>.json.tmp`，`json.dump` 成功之后才 `os.replace(tmp, path)`：
+`set` 不立刻落盘 —— 它只改内存、重置一个 `save_delay` 秒的定时器：
 
 ```python
-def _save(self):
-    tmp_path = f"{self.path}.tmp"
-    with open(tmp_path, 'w', encoding='UTF-8') as f:
-        json.dump(self.config, f, indent=4, ensure_ascii=False)
-    os.replace(tmp_path, self.path)
+def _save(self):                 # 调用方已持 config_lock
+    self._dirty = True
+    if self._save_delay <= 0:
+        self._flush_locked() # 直接调用原子写入
+        return
+    if self._save_timer is not None:
+        self._save_timer.cancel()
+    t = threading.Timer(self._save_delay, self.flush) # 定时器结束后调用原子写入
+    t.daemon = True
+    self._save_timer = t
+    t.start()
+
+ def _atomic_write(self) -> None:
+     """原子落盘：唯一临时名 + 写完替换（带重试）。
+     """
+     directory = os.path.dirname(self.path) or "."
+     fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".cfg-", suffix=".tmp")
+     try:
+         with os.fdopen(fd, 'w', encoding='UTF-8') as f:
+             json.dump(self.config, f, indent=4, ensure_ascii=False)
+         _replace_with_retry(tmp_path, self.path)
+     except BaseException:
+         try:
+             os.unlink(tmp_path)
+         except OSError:
+             pass
+         raise
+
+def _replace_with_retry(src: str, dst: str, tries: int = 8) -> None:
+    """``os.replace`` + 退避重试，专治 Windows 瞬时 ``PermissionError``。
+    """
+    delay = 0.02
+    for i in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == tries - 1:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.5)
 ```
 
 直接以 `'w'` 打开原文件写，会在序列化失败时把文件**截断成半截**
@@ -578,15 +616,15 @@ default_config_callback（仅 init_use_callback=True） > default_config > 类�
 **行为层**：模板方法、订阅、锁、广播、唯一派发点都在这里。
 `Config`（文件版）与 `ConfigMemory`（内存版）是它的**平级兄弟**。
 
-| 方法 | 说明 |
-|---|---|
-| `get` / `set` / `reset` | 标准三件套模板：加锁 → 子类存储原语 → 落盘/广播 → 解锁 → `_dispatch()` |
-| `on` / `off` / `value_changed` / `off_value_changed` | 订阅（`_dispatch` 逐条隔离：一个回调炸了不影响其余） |
-| `_dispatch(key, value)` | **唯一派发点**。要接管通知（例如 Qt 桥排队回本线程），重写这一个方法 |
-| `memory(defaults=None)` | 类方法，**兼容 / 快速路径**：造一个内存版的自己（内部按 `cls.DEFAULTS` 合成临时声明类）。正经配置请定义类：`class AppMem(ConfigMemory, AppKeys)` |
-| `update_config()` | 把当前配置推给所有注册过的子进程队列（没队列就是空操作） |
-| `configupdate_config(key, last_value=None)` | 默认值热更新 |
-| `item(key)` | 取一个显式代理（未声明的键 / 撞保留字的键走这条） |
+| 方法                                                   | 说明                                                                                                     |
+|------------------------------------------------------|--------------------------------------------------------------------------------------------------------|
+| `get` / `set` / `reset`                              | 标准三件套模板：加锁 → 子类存储原语 → 落盘/广播 → 解锁 → `_dispatch()`                                                       |
+| `on` / `off` / `value_changed` / `off_value_changed` | 订阅（`_dispatch` 逐条隔离：一个回调炸了不影响其余）                                                                       |
+| `_dispatch(key, value)`                              | **唯一派发点**。要接管通知（例如 Qt 桥排队回本线程），重写这一个方法                                                                 |
+| `memory(defaults=None)`                              | 类方法，**兼容 / 快速路径**：造一个内存版的自己（内部按 `cls.DEFAULTS` 合成临时声明类）。正经配置请定义类：`class AppMem(ConfigMemory, AppKeys)` |
+| `update_config()`                                    | 把当前配置推给所有注册过的子进程队列（没队列就是空操作）                                                                           |
+| `configupdate_config(key, last_value=None)`          | 默认值热更新                                                                                                 |
+| `item(key)`                                          | 取一个显式代理（未声明的键 / 撞保留字的键走这条）                                                                             |
 
 子类只需要实现五个存储原语：`_read` / `_read_all` / `_write` / `_apply_reset` / `_save`。
 
@@ -603,30 +641,37 @@ Config(
 )
 ```
 
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `file_name` | `str` | `"config"` | 配置文件名，不含 `.json` |
-| `default_config` | `dict` | `None` | 默认配置字典，缺失的 key 自动补齐 |
-| `default_config_callback` | `Callable` | `None` | 默认配置回调，接受当前 config 字典作为参数，重置时再次调用 |
-| `init_use_callback` | `bool` | `True` | 初始化时是否用回调拿默认配置 |
+| 参数                        | 类型         | 默认值        | 说明                                           |
+|---------------------------|------------|------------|----------------------------------------------|
+| `file_name`               | `str`      | `"config"` | 配置文件名，不含 `.json`                             |
+| `default_config`          | `dict`     | `None`     | 默认配置字典，缺失的 key 自动补齐                          |
+| `default_config_callback` | `Callable` | `None`     | 默认配置回调，接受当前 config 字典作为参数，重置时再次调用            |
+| `init_use_callback`       | `bool`     | `True`     | 初始化时是否用回调拿默认配置                               |
+| `save_delay`              | `float`    | `0.5`      | set 后延迟多久落盘。窗口内多次 set 只写一次。<= 0 表示每次 set 立即写 |
+| `save_on_exit`	           | `bool`	    | `True`	    | 是否注册 atexit，在进程正常退出时自动 flush                 |
 
 **方法：**
 
-| 方法 | 说明 |
-|------|------|
-| `get(key)` | 获取配置值。`key="all"` 从文件重读并**替换内存副本**，返回全部配置字典；缺键抛 `KeyError` |
-| `set(key, value)` | 设置配置值，自动写文件并广播，然后派发通知 |
-| `reset(key)` | 恢复默认值。`key="all"` 恢复全部 |
-| `configget(key)` / `configset(key, value)` / `configreset(key)` | 老名字，转发到上面三个 |
-| `configupdate_config(key, last_value=None)` | 默认值热更新。用户未修改过该 key 时同步为新默认值。需预置 `"{key}_reseted": False` 标记，缺了抛 `KeyError` |
-| `update_config()` | 向所有注册的子进程广播当前配置 |
-| `path` | property，`"<file_name>.json"` |
+| 方法                                                              | 说明                                                                         |
+|-----------------------------------------------------------------|----------------------------------------------------------------------------|
+| `get(key)`                                                      | 获取配置值。`key="all"` 从文件重读并**替换内存副本**，返回全部配置字典；缺键抛 `KeyError`                 |
+| `set(key, value)`                                               | 设置配置值，自动写文件并广播，然后派发通知                                                      |
+| `reset(key)`                                                    | 恢复默认值。`key="all"` 恢复全部                                                     |
+| `configget(key)` / `configset(key, value)` / `configreset(key)` | 老名字，转发到上面三个                                                                |
+| `configupdate_config(key, last_value=None)`                     | 默认值热更新。用户未修改过该 key 时同步为新默认值。需预置 `"{key}_reseted": False` 标记，缺了抛 `KeyError` |
+| `update_config()`                                               | 向所有注册的子进程广播当前配置                                                            |
+| `path`                                                          | property，`"<file_name>.json"`                                              |
+| `flush()`                                                       | 立刻把待落盘的改动写出（取消定时器 + _atomic_write）。幂等，可重复调。退出前、交给外部工具读之前、fork 之前调          |
 
 **行为要点：**
 
 - 构造时只捕 `FileNotFoundError`；其余异常上抛，坏文件不被覆盖
 - 配置项缺的键会自动补进文件（只补缺的，不覆盖已有的）
 - 落盘是原子写
+- `set` **延迟落盘**：改内存 + 重置定时器，`save_delay` 秒后才真正写文件；窗口内多次写合并成一次
+- `reset` **立即落盘**：不走延迟，写失败会打堆栈、保留 `_dirty`，下次 flush 重试
+- `get('all')` 会**先 flush 再重读文件**（见「数据安全」第 3 条）—— 等于强制同步一次
+- 进程正常退出（`atexit`）时自动 `flush`
 
 ### ConfigMemory
 
@@ -734,7 +779,7 @@ ConfigInChildProcessPipe(config_set_queue, config_get_queue)
 8. **子进程的 `get('all')` 是"最近一次广播"的快照** — 不是实时：自己刚 `set` 的在、别的进程刚写的可能还没到。要严格最新就回主进程读；枚举键（`keys.orphans()`）用它没问题
 9. **老名字不要拿去覆写** — 子类实现 `get` / `set` / `reset`；`configget` / `configset` / `configreset` 是接口层的转发壳
 10. **`get('all')` 有重读文件并替换内存副本的副作用** — 要读单键就用 `get(key)`
-
+11. **延迟落盘有窗口** — `set` 返回时值只在内存里；要保证某次改动已经进文件，就 `cfg.flush()`。进程被 `SIGKILL` / `os._exit()` 干掉时 `atexit` 不跑，窗口内的改动会丢
 ## 许可证
 
 MIT

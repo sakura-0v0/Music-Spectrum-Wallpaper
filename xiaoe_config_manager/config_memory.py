@@ -115,3 +115,6 @@ class ConfigMemory(ConfigBase):
 
     def _save(self) -> None:
         """内存版没有落盘这一步。"""
+
+    def _flush_locked(self) -> None:
+        """内存版没有落盘这一步。"""

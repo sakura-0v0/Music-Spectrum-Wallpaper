@@ -15,9 +15,14 @@
 
 from __future__ import annotations
 
+import atexit
 import copy
 import json
 import os
+import tempfile
+import threading
+import time
+import traceback
 from typing import Any, Callable
 
 from xiaoe_config_manager.config_base import ConfigBase
@@ -33,12 +38,16 @@ class Config(ConfigBase):
     也就是说：显式传了 ``default_config`` 时，声明里的默认值不参与
     （要合并请自己合，别指望隐式规则）。
 
+    新版本落盘有延迟，虽然注册了atexit.register，但是强烈建议退出时执行一次 flush()
+    显示将落盘。
     Args:
         file_name: 配置文件名（不带 ``.json``）。
         default_config: 静态默认配置（配置里缺的键会自动补上）。
         default_config_callback: 动态默认配置回调，参数是当前配置（仅当
             ``init_use_callback=True`` 时在初始化阶段调用；reset 时总会调用）。
         init_use_callback: 初始化阶段是否用回调拿默认配置。
+        save_delay: 延迟落盘的时间（s），避免高频写入文件。设置0则退回立即落盘。
+        save_on_exit: 自动在退出时执行落盘。
     """
 
     def __init__(
@@ -47,11 +56,15 @@ class Config(ConfigBase):
             default_config: dict | None = None,
             default_config_callback: Callable | None = None,
             init_use_callback: bool = True,
+            save_delay: float = 0.5,
+            save_on_exit: bool = True,
     ):
         super().__init__(default_config=default_config,
                          default_config_callback=default_config_callback)
         self.fname = file_name
-
+        self._save_delay = save_delay
+        self._save_timer: threading.Timer | None = None
+        self._dirty = False
         try:
             self.config = self._read_all()
         except FileNotFoundError:
@@ -74,8 +87,10 @@ class Config(ConfigBase):
                 self.config[key] = value
                 changed = True
         if changed:
-            self._save()
+            self._atomic_write()
 
+        if save_on_exit:
+            atexit.register(self.flush)
     # ══════════════════════════════════════════════════════════
     # 存储原语
     # ══════════════════════════════════════════════════════════
@@ -100,6 +115,11 @@ class Config(ConfigBase):
         return copy.deepcopy(self.config[key])
 
     def _read_all(self) -> dict:
+        """加锁读整份配置 —— 从文件重读，并替换内存副本。"""
+        with self.config_lock:
+            return self._read_all_locked()
+
+    def _read_all_locked(self) -> dict:
         """读整份配置 —— 从文件重读，并替换内存副本。
 
         返回的是**深拷贝**（嵌套结构也一样独立）。
@@ -107,6 +127,7 @@ class Config(ConfigBase):
         注意这条副作用：文件里的内容会覆盖 ``self.config``（本进程未落盘的中间
         状态因此丢掉），换来的是别人刚写进去的值能看到。
         """
+        self._flush_locked()
         with open(self.path, 'r', encoding='UTF-8') as f:
             self.config = json.load(f)
         return copy.deepcopy(self.config)
@@ -133,15 +154,78 @@ class Config(ConfigBase):
             self.config = default_config
         else:
             self.config[key] = default_config[key]
+        self._dirty = True
 
     def _save(self) -> None:
-        """原子落盘：先写临时文件，成功之后再替换。
+        """调度落盘（调用方已持 config_lock）。只标记 + 重置定时器，不写文件。
 
-        直接以 ``'w'`` 打开原文件写会在序列化失败时把文件截断成半截
-        （``json.dump`` 的类型错误、磁盘写满），下次启动就是坏配置 —— 那正是
-        「配置全丢」这条故障链的第一步。
+        ``save_delay <= 0`` 时退化成立刻落盘。
         """
-        tmp_path = f"{self.path}.tmp"
-        with open(tmp_path, 'w', encoding='UTF-8') as f:
-            json.dump(self.config, f, indent=4, ensure_ascii=False)
-        os.replace(tmp_path, self.path)
+        self._dirty = True
+        if self._save_delay <= 0:
+            self._flush_locked()
+            return
+        if self._save_timer is not None:
+            self._save_timer.cancel()
+        t = threading.Timer(self._save_delay, self.flush)
+        t.daemon = True
+        self._save_timer = t
+        t.start()
+
+    def _flush_locked(self) -> None:
+        """调用方已持 config_lock。取消挂起的定时器并落盘。幂等。"""
+        if self._save_timer is not None:
+            self._save_timer.cancel()
+            self._save_timer = None
+        if not self._dirty:
+            return
+        try:
+            self._atomic_write()
+        except Exception:                     # noqa: BLE001
+            # 写失败保持 _dirty，留给下一次 flush（含 atexit）重试
+            traceback.print_exc()
+            return
+        self._dirty = False
+
+    def flush(self) -> None:
+        """把内存里的配置立刻写到磁盘。退出前必须调用；幂等，可重复调。"""
+        with self.config_lock:
+            self._flush_locked()
+
+    def _atomic_write(self) -> None:
+        """原子落盘：唯一临时名 + 写完替换（带重试）。
+
+        - 临时名唯一（``mkstemp``）：两个写者抢同一个 ``.tmp``，一个正在写、
+          另一个把它搬走，就会互相打脸。
+        - 替换带重试：Windows 上 Defender / 索引服务 / 别的进程刚打开过文件，
+          句柄要几十毫秒才放，不重试就是偶发 ``PermissionError``。
+        """
+        directory = os.path.dirname(self.path) or "."
+        fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".cfg-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, 'w', encoding='UTF-8') as f:
+                json.dump(self.config, f, indent=4, ensure_ascii=False)
+            _replace_with_retry(tmp_path, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+def _replace_with_retry(src: str, dst: str, tries: int = 8) -> None:
+    """``os.replace`` + 退避重试，专治 Windows 瞬时 ``PermissionError``。
+
+    只吃 ``PermissionError``（文件被临时占用）；磁盘满、路径不存在这类
+    ``OSError`` 照旧往上抛。
+    """
+    delay = 0.02
+    for i in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == tries - 1:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.5)

@@ -92,6 +92,10 @@ class ConfigBase(ConfigDeclareMixin, ConfigApi):
         """读整份配置（子类实现）。"""
         raise NotImplementedError
 
+    def _read_all_locked(self) -> Any:
+        """读整份配置调用方已持 config_lock。与锁无关则直接路由_read_all。"""
+        return self._read_all()
+
     def _write(self, key: str, value: Any) -> None:
         """写一个键（子类实现）。只改存储，不负责派发；调用方已持锁。
 
@@ -110,6 +114,10 @@ class ConfigBase(ConfigDeclareMixin, ConfigApi):
         raise NotImplementedError
 
     def _save(self) -> None:
+        """延迟持久化（子类实现）。内存版是空实现；调用方已持锁。"""
+        raise NotImplementedError
+
+    def _flush_locked(self) -> None:
         """持久化（子类实现）。内存版是空实现；调用方已持锁。"""
         raise NotImplementedError
 
@@ -174,9 +182,9 @@ class ConfigBase(ConfigDeclareMixin, ConfigApi):
                     None if key == "all" else self.config
                 ))
             self._apply_reset(key)
-            self._save()
+            self._flush_locked()
             self.update_config()
-            new_value = self._read_all() if key == "all" else self._read(key)
+            new_value = self._read_all_locked() if key == "all" else self._read(key)
         self._dispatch(key, new_value)
 
     def update_config(self):

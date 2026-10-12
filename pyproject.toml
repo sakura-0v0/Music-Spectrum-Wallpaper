@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xiaoe-config-manager"
-version = "2.1.2"
+version = "2.2.0"
 description = "多进程安全的 JSON 配置文件管理器，支持默认配置、动态重置与进程间自动同步"
 readme = "README.md"
 license = "MIT"
