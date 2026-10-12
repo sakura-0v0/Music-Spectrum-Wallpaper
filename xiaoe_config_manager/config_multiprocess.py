@@ -128,6 +128,16 @@ class ConfigInMainProcessPipe:
             self._loop_thread.join()
         except Exception:                            # noqa: BLE001
             traceback.print_exc()
+        try:
+            self.config.queues.remove((self.config_set_queue, self.config_get_queue))
+        except ValueError:
+            pass
+        for q in (self.config_set_queue, self.config_get_queue):
+            try:
+                q.close()
+                q.join_thread()
+            except Exception:
+                traceback.print_exc()
 
 
 class ConfigInChildProcessPipe(ConfigBase):
@@ -262,3 +272,9 @@ class ConfigInChildProcessPipe(ConfigBase):
             self._update_config_loop_thread.join()
         except Exception:                            # noqa: BLE001
             traceback.print_exc()
+        for q in (self.config_set_queue, self.config_get_queue):
+            try:
+                q.close()
+                q.join_thread()
+            except Exception:
+                traceback.print_exc()
