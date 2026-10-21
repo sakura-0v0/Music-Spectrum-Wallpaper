@@ -23,9 +23,10 @@ import tempfile
 import threading
 import time
 import traceback
-from typing import Any, Callable
+from typing import Callable
 
 from xiaoe_config_manager.config_base import ConfigBase
+from xiaoe_config_manager.config_types import ConfigDict, ConfigValue
 
 __all__ = ["Config"]
 
@@ -100,7 +101,7 @@ class Config(ConfigBase):
         """配置文件的完整路径（``<file_name>.json``）。"""
         return f"{self.fname}.json"
 
-    def _read(self, key: str) -> Any:
+    def _read(self, key: str) -> ConfigValue:
         """读单个键。
 
         返回的是**深拷贝**：调用方改这个值（哪怕它是嵌套的 list / dict）也不会
@@ -132,19 +133,27 @@ class Config(ConfigBase):
             self.config = json.load(f)
         return copy.deepcopy(self.config)
 
-    def _write(self, key: str, value: Any) -> None:
+    def _write(self, key: str, value: ConfigValue) -> None:
         """写进内存副本（真正落盘在 :meth:`_save`）。
 
         存的是 ``value`` 的**深拷贝**：调用方之后改自己那个对象，配置不受影响。
+
+        用的是 copy-on-write：浅拷贝一份、改完换引用。``update_config`` 会把
+        ``self.config`` 直接交给子进程队列，真正的 pickle 发生在队列的 feeder
+        线程里；原地改会让那个线程读到一个边写边读的 dict。
 
         Args:
             key: 配置键名。
             value: 配置值。
         """
-        self.config[key] = copy.deepcopy(value)
+        new = dict(self.config)
+        new[key] = copy.deepcopy(value)
+        self.config = new
 
     def _apply_reset(self, key: str) -> None:
         """按 ``self.default_config`` 改回默认值。
+
+        同样是 copy-on-write，理由见 :meth:`_write`。
 
         Args:
             key: 配置键名，或 ``'all'``。
@@ -153,7 +162,9 @@ class Config(ConfigBase):
         if key == "all":
             self.config = default_config
         else:
-            self.config[key] = default_config[key]
+            new = dict(self.config)
+            new[key] = default_config[key]
+            self.config = new
         self._dirty = True
 
     def _save(self) -> None:

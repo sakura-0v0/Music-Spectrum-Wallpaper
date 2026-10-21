@@ -20,9 +20,9 @@
 from __future__ import annotations
 
 import copy
-from typing import Any
 
 from xiaoe_config_manager.config_base import ConfigBase
+from xiaoe_config_manager.config_types import ConfigDict, ConfigValue
 
 __all__ = ["ConfigMemory"]
 
@@ -52,26 +52,26 @@ class ConfigMemory(ConfigBase):
     ``fname`` 是 ``None``（没有文件）—— 调试时 ``cfg.fname is None`` 就说明这是内存版。
     """
 
-    def __init__(self, data: dict | None = None):
+    def __init__(self, default_config: dict | None = None):
         """建一份内存配置。
 
         Args:
-            data: 初始值，**盖在**类声明的默认值上面；同时也是 reset 的目标。
+            default_config: 初始值，**盖在**类声明的默认值上面；同时也是 reset 的目标。
                 不传就直接用 ``type(self).DEFAULTS``（与文件版
                 ``Config(路径)`` 退回声明默认值是同一个规则）。
         """
-        merged = {**(type(self).DEFAULTS or {}), **(data or {})}
+        merged = {**(type(self).DEFAULTS or {}), **(default_config or {})}
         super().__init__(default_config=merged)
         #: 没有文件（保留这个名字是为了和 Config 对称，也方便调试时一眼看出）
         self.fname = None
-        # 深拷贝：类声明的默认值、调用方传进来的 data 都不能与该实例共享嵌套对象
+        # 深拷贝：类声明的默认值、调用方传进来的 default_config 都不能与该实例共享嵌套对象
         self.config = copy.deepcopy(merged)
 
     # ══════════════════════════════════════════════════════════
     # 存储原语
     # ══════════════════════════════════════════════════════════
 
-    def _read(self, key: str) -> Any:
+    def _read(self, key: str) -> ConfigValue:
         """读一个键。
 
         返回的是**深拷贝**：调用方改这个值（哪怕它是嵌套的 list / dict）也不会
@@ -88,22 +88,36 @@ class ConfigMemory(ConfigBase):
         return copy.deepcopy(self.config[key])
 
     def _read_all(self) -> dict:
-        """读整份配置（深拷贝，改它——包括改嵌套的值——都不会影响配置本身）。"""
+        """读整份配置（深拷贝，改它——包括改嵌套的值——都不会影响配置本身）。
+
+        ``self.config`` 是 copy-on-write 的：每次写入都换一个新的 dict，旧对象
+        发布出去之后永远不会再被改。所以这里读到的引用是一致的快照，不需要持锁
+        也不会撞上 "dictionary changed size during iteration"。
+        """
         return copy.deepcopy(self.config)
 
-    def _write(self, key: str, value: Any) -> None:
-        """写进内存 dict。
+    def _write(self, key: str, value: ConfigValue) -> None:
+        """写进内存 dict（copy-on-write：浅拷贝一份、改完换引用）。
 
         存的是 ``value`` 的**深拷贝**：调用方之后改自己那个对象，配置不受影响。
+
+        为什么不用 ``self.config[key] = ...`` 原地改：``update_config`` 会把
+        ``self.config`` 直接交给子进程队列，而真正的 pickle 发生在队列的 feeder
+        线程里。原地改会让那个线程读到一个边写边读的 dict；换成"改新的、换引用"
+        之后，已经发布出去的那个 dict 就固定下来了。
 
         Args:
             key: 配置键名。
             value: 配置值。
         """
-        self.config[key] = copy.deepcopy(value)
+        new = dict(self.config)
+        new[key] = copy.deepcopy(value)
+        self.config = new
 
     def _apply_reset(self, key: str) -> None:
         """按 ``self.default_config`` 改回默认值（深拷贝，不与默认值共享嵌套对象）。
+
+        同样是 copy-on-write，理由见 :meth:`_write`。
 
         Args:
             key: 配置键名，或 ``'all'``。
@@ -111,7 +125,9 @@ class ConfigMemory(ConfigBase):
         if key == "all":
             self.config = copy.deepcopy(self.default_config)
         else:
-            self.config[key] = copy.deepcopy(self.default_config[key])
+            new = dict(self.config)
+            new[key] = copy.deepcopy(self.default_config[key])
+            self.config = new
 
     def _save(self) -> None:
         """内存版没有落盘这一步。"""

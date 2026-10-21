@@ -13,6 +13,8 @@
 - :class:`ConfigDeclareMixin` 类：把声明键变成点操作属性（Config 系列已继承）
 - :class:`ConfigItemProxy` 类：点操作代理（``cfg.键名.get()/.set(v)/.reset()``）
 - :func:`default`：声明默认值
+- :data:`ConfigValue` / :data:`ConfigDict`：配置值的类型（给注解用）
+- :data:`DATA_TYPES`：由 ``ConfigValue`` 推导的运行时元组（给 ``isinstance`` 用）
 """
 
 from .config import Config
@@ -29,20 +31,22 @@ from .config_memory import ConfigMemory
 from .config_multiprocess import (
     ConfigInChildProcessPipe,
     ConfigInMainProcessPipe,
-    diff_changes,
 )
+from .config_types import DATA_TYPES, ConfigDict, ConfigValue
 
 __all__ = [
+    "DATA_TYPES",
     "Config",
     "ConfigApi",
     "ConfigBase",
     "ConfigDeclareMixin",
+    "ConfigDict",
     "ConfigInChildProcessPipe",
     "ConfigInMainProcessPipe",
     "ConfigItemProxy",
     "ConfigKeysBase",
     "ConfigMemory",
+    "ConfigValue",
     "collect_defaults",
     "default",
-    "diff_changes",
 ]

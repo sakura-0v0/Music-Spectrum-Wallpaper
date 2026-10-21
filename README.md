@@ -1,38 +1,47 @@
 # xiaoe-config-manager
 
-多进程安全的 JSON 配置文件管理器，纯 Python 标准库实现，零外部依赖。
+多进程安全的 JSON 配置文件管理器，纯 Python 标准库实现，零依赖。配置值常驻进程内存，读写线程安全，落盘是原子替换，子进程通过队列自动同步。
 
-标准接口是 **`get` / `set` / `reset`**。老名字 `configget` / `configset` /
-`configreset` 仍然可用，它们在本层**反向转发**到新名字 —— 子类只需要实现新的三个。
+## 一套接口，三个后端
 
-读出来、写进去的值都是**深拷贝**：嵌套的 list / dict 也不跟调用方共享，改哪边都不会串。
+这个包里有三个类，用法几乎一样：都是先写一个声明式的配置类，再把类接上，然后 `cfg.字段.get()` / `.set()` / `.reset()`。
 
-## 特性
+| 类                          | 值存在哪               | 单键读的开销  |
+|----------------------------|--------------------|---------|
+| `Config`                   | 进程内存，写时落盘到 JSON 文件 | 读内存     |
+| `ConfigMemory`             | 进程内存里的 dict        | 读内存     |
+| `ConfigInChildProcessPipe` | 子进程内存缓存，由主进程广播刷新   | 本进程内读内存 |
 
-- **标准三件套** — `get` / `set` / `reset` 是接口；`configget` / `configset` / `configreset` 是兼容壳，转发到它们
-- **统一接口** — `ConfigApi(ABC)` 定义 `get/set/reset` + 订阅 `on/off/value_changed/off_value_changed`（共 10 个公开成员），文件版 / 内存版 / 子进程版都是它的实现
-- **声明式配置** — `ConfigKeysBase`（纯声明）+ `ConfigDeclareMixin`（点操作属性）+ `ConfigItemProxy`，键名与默认值只写一处
-- **线程安全** — 内置线程锁，单进程多线程环境下安全读写
-- **多进程安全** — 通过 `multiprocessing.Queue` 双向管道实现主进程与子进程之间的配置自动同步
-- **变更通知自动** — 本进程写当场派发；跨进程写按逐键 diff 派发；自己的回声被 diff 吞掉，不会双发
-- **延迟落盘** — `set` 只改内存并重置定时器（默认 0.5s），窗口内多次写只落盘一次；`reset` / `get('all')` / `flush()` / 进程正常退出都会强制把待写数据落到磁盘
-- **数据安全** — 配置文件损坏时**原样抛异常、绝不覆盖**；落盘是原子写（写 `.tmp` 再 `os.replace`）
-- **值不共享** — 读出来、写进去的都是**深拷贝**（嵌套的 list / dict 也一样）：配置里的对象永远不会被外部改到，外部对象也不会被配置改到
-- **点操作 API** — `cfg.app_name.get() / .set(v) / .reset()`，配合 `ConfigItemProxy[T]` 提供完整静态类型检查
-- **类型注解友好** — `default()` 自动推断，`ConfigItemProxy[T]` 显式声明，IDE 补全与类型检查全程可用
-- **默认配置** — 支持静态默认字典和动态回调两种方式，配置项缺失时自动补齐
-- **配置重置** — 支持单个 key 或全部配置一键恢复默认值
-- **默认值热更新** — 当默认配置变化时，自动识别用户未修改的项并更新为新默认值
-- **内存版** — 和文件版**同一种创建方式：定义类**（`class AppMem(ConfigMemory, AppKeys)` → `AppMem()`），同样是声明默认值 + 点操作，只是不落盘；`Config.memory({...})` 作为兼容 / 快速路径保留
-- **纯标准库** — 无任何第三方依赖，仅使用 `json`、`threading`、`multiprocessing` 等标准库
+```python
+from xiaoe_config_manager import (
+    Config, ConfigMemory, ConfigInChildProcessPipe, ConfigKeysBase, default,
+)
 
-## 运行要求
+class AppKeys(ConfigKeysBase):
+    """共用的Key类"""
+    app_name = default("myapp")
+    timeout  = default(30)
 
-| 项 | 要求 |
-|---|---|
-| Python | **>= 3.10** |
-| 运行时依赖 | **零依赖**（纯标准库） |
-| 跑测试 | `pip install -e ".[dev]"`（`pytest` 在 `[dev]` extra 里） |
+class AppConfig(Config, AppKeys): ... # 组合
+class AppMemory(ConfigMemory, AppKeys): ...  # 组合
+
+cfg = AppConfig("app")                      # 落盘到 app.json
+cfg.timeout.get()       # 30
+
+mem = AppMemory()        # 只在内存里
+mem.timeout.set(60)      # 只改内存
+
+# 子进程中，将主进程管道生成的(set_q, get_q)传入。
+child = ConfigInChildProcessPipe(set_q, get_q)   # 子进程里，自动和主进程同步
+child.app_name.get()    # 读本地缓存，不跨进程
+child.app_name.set("app_1")  # 自动广播到全部进程，开销较大但是可以接受
+```
+
+## 读操作都在内存里
+
+除 `get('all')` 外，所有读都直接取当前进程内存里的副本。界面刷新、事件回调这类每秒几百次的路径可以放心读。
+
+程序跑起来之后，手动改 `<name>.json` 不会生效。文件版如果确实需要重读，调用 `cfg.get("all")` 即可从文件重读。
 
 ## 安装
 
@@ -40,11 +49,11 @@
 pip install xiaoe-config-manager
 ```
 
+要求 Python 3.10 以上。
+
 ## 快速开始
 
-### 定义配置类
-
-单进程场景直接给 `Config` 接一份声明（或把默认值写在 `Config` 子类自己的类体里）。
+声明Keys类，与Config类组合并实例化：
 
 ```python
 from xiaoe_config_manager import Config, ConfigKeysBase, default
@@ -57,214 +66,125 @@ class AppKeys(ConfigKeysBase):
 
 class AppConfig(Config, AppKeys):
     ...
-```
 
-> 也可以直接 `class AppConfig(Config)` 把默认值写在 `Config` 的子类类体里 ——
-> 实现类自己的类体同样会被扫描。拆出 `AppKeys` 是为了多进程场景能两边共用一份声明，
-> 见[多进程使用](#多进程使用)。
-
-### 使用
-
-```python
 cfg = AppConfig(file_name="app_config")
 
-# 点操作（推荐）
-cfg.app_name.get()          # "myapp"
-cfg.timeout.set(60)         # 修改并写文件
-cfg.timeout.get()           # 60
-cfg.timeout.reset()         # 恢复默认
-cfg.timeout.get()           # 30
-cfg.flush()                 # 立刻把待落盘的改动写出（不等到定时器到点）
-
-# 标准三件套
-cfg.set("timeout", 60)
-cfg.get("timeout")          # 60
-cfg.get("all")              # 返回全部配置字典
-cfg.reset("all")            # 恢复全部
-
-# 老接口（等价，转发到上面三个）
-cfg.configset("timeout", 60)
-cfg.configget("timeout")    # 60
-cfg.configreset("all")
+cfg.app_name.get()      # "myapp"
+cfg.timeout.set(60)     # 改内存并安排落盘
+cfg.timeout.get()       # 60
+cfg.timeout.reset()     # 恢复默认
+cfg.flush()             # 立刻落盘，不等定时器
 ```
 
-### 四种 API 风格对照
+### 点键访问和直接调用
 
-| 风格 | 写 | 读 | 重置 |
+声明过的键可以直接 `cfg.字段`，也可以走 `cfg.get("字段")`。两种写法操作的是同一份数据，可以混用。
+
+| 写法 | 读 | 写 | 重置 |
 |---|---|---|---|
-| **点操作**（推荐） | `cfg.timeout.set(60)` | `cfg.timeout.get()` | `cfg.timeout.reset()` |
-| **标准接口** | `cfg.set("timeout", 60)` | `cfg.get("timeout")` | `cfg.reset("timeout")` |
-| 老接口（兼容壳） | `cfg.configset("timeout", 60)` | `cfg.configget("timeout")` | `cfg.configreset("timeout")` |
-| 显式代理 | `cfg.item("timeout").set(60)` | `cfg.item("timeout").get()` | `cfg.item("timeout").reset()` |
+| 点键访问 | `cfg.timeout.get()` | `cfg.timeout.set(60)` | `cfg.timeout.reset()` |
+| 传键名 | `cfg.get("timeout")` | `cfg.set("timeout", 60)` | `cfg.reset("timeout")` |
+| 显式句柄 | `cfg.item("timeout").get()` | `cfg.item("timeout").set(60)` | `cfg.item("timeout").reset()` |
 
-四者操作同一份底层数据，可以混用。`get("all")` 是"整份配置"的统一入口。
-最后一行是**未声明的键**（或撞了保留字的键）的入口 —— 声明的键直接 `cfg.键名` 就够了。
+`get("all")` 从文件中重读整份配置，`reset("all")` 重置整份。
 
-> **谁实现谁**：子类实现的是 `get` / `set` / `reset`；`configget` / `configset` /
-> `configreset` 由 `ConfigApi` 提供，内部就是 `return self.get(key)` 这类一行转发 ——
-> **不要覆写老名字**，覆写点只有一个方向。
+> 旧名字 `configget` / `configset` / `configreset` 也还能用，它们内部转给 `get` / `set` / `reset`，行为完全一样，但**不建议在新代码里使用**。实现新的后端时覆写 `get` / `set` / `reset` 即可，不要覆写旧名字。
 
-## 声明式配置
+### 命名与扫描规则
 
-三样东西各管一段：
-
-| 名字 | 职责 |
-|---|---|
-| `ConfigKeysBase` | **纯声明基类**。子类只放「键名 = 默认值」，`__init_subclass__` 算出 `DEFAULTS` |
-| `ConfigDeclareMixin` | 在 `ConfigKeysBase` 之上，把每个键做成实例上的 property，`cfg.speed` 返回代理。`ConfigBase` 继承它 |
-| `ConfigItemProxy[T]` | 点操作代理，只转发 `owner.get/set/reset/on/off` |
-| `default(value)` / `default(None, type_)` | 声明默认值，运行时原样返回传入值，只为类型推断与可读性存在 |
-
-一份声明可以多处消费：
-
-```python
-from xiaoe_config_manager import Config, ConfigKeysBase, default
-
-class AppKeys(ConfigKeysBase):
-    app_name = default("myapp")
-
-AppKeys.DEFAULTS                                # {'app_name': 'myapp'}
-Config("app", default_config=AppKeys.DEFAULTS)  # 非声明式消费（照样能用）
-class AppConfig(Config, AppKeys): ...           # 声明式消费（顺带有点操作）
-```
-
-### 扫描规则
-
-1. 只扫 **`ConfigKeysBase` 的子类**，以及**实现类自己的类体**；后端类
-   （`Config` / `ConfigMemory` / 管道 / Qt 桥）的类字典**一律不扫**。
-2. 默认值必须是 `str / int / float / bool / list / dict / tuple / None` 之一
-   （即 `DATA_TYPES`）—— 函数、property 之类不是配置项，会被忽略。
-   `JSON` 里没有 `tuple`，写进去读回来会变成 `list`。
-3. 键名**命中保留字当场 `TypeError`**（不静默）：先查显式清单（`config` / `fname` /
-   `queues` / `default_config` / `value_changed` / `item` / `keys` / `instance` /
-   `memory` / `persist` / `DEFAULTS` / **`all`** 等），再动态查实现类 MRO 上已有的属性名
-   （`off_value_changed` / `on` / `off` / `get` / `set` / `reset` 这些**方法名**就是这么被拦下的，
-   所以它们同样不能当配置键）。
-   `all` 是 `get('all')`（读整份）/ `reset('all')`（重置整份）用的特殊键名，
-   **声明它等于声明一个永远读不到的键**，所以直接拦掉；它也**不能写**
-   （`set('all', ...)` 抛 `TypeError`）。
-4. **一条继承链上重复声明同一个键 → `TypeError`**（`class Child(AppKeys)` 里又写了一遍
-   `app_name`）；**兄弟基类同名不拦**，按 Python 的 MRO 走 —— 左边的赢。
+1. 只收集 `ConfigKeysBase` 的子类，以及实现类自己的类体。
+2. 默认值必须是 `str`、`int`、`float`、`bool`、`list`、`dict`、`None` 之一，其它一律在类创建时抛 `TypeError`。判据是「它能不能当一个配置值」，不是猜作者想干嘛。类体里的方法、嵌套类、模块，以及下划线开头的名字，属于本来就不是配置项的东西，直接跳过，不算违规。
+3. 键名撞了保留字会当场抛 `TypeError`，不会静默跳过。检查分两层：先看固定清单（`config`、`fname`、`queues`、`default_config`、`item`、`memory`、`DEFAULTS`、`all` 等），再动态查实现类 MRO 上已有的属性名，所以 `get`、`set`、`on` 这些方法名同样不能当键名。`all` 尤其特殊：它是 `get('all')` 和 `reset('all')` 专用的键名。
+4. 一条继承链上重复声明同一个键会抛 `TypeError`。兄弟基类同名不拦，按 MRO 走，优先取左。
 
 ```python
 class ParentKeys(ConfigKeysBase):
     app_name = default("p")
 
 class ChildKeys(ParentKeys):
-    app_name = default("c")      # TypeError：重复声明了继承链上已有的配置键
+    app_name = default("c")      # TypeError：继承链上已经有这个键
+
+class Broken(ConfigKeysBase):
+    pair = (1, 2)                # TypeError：tuple 不是配置值
+    _RETRY = (1, 2, 3)           # 下划线开头，跳过，不报错
+    def helper(self): ...        # 方法，跳过，不报错
 ```
 
-撞了保留字的键（或压根没声明的键）想**读**，用显式入口：`cfg.item("原名").get()` ——
-但特殊键名 `all` 只能走 `cfg.get("all")` / `cfg.reset("all")`，写不了。
+> `tuple` 不在允许清单里。它写进 JSON 会退化成 `list`，读回来类型就变了，不如在声明时就拦下。
 
 ## 类型注解
 
-模块所有点操作 API 都支持静态类型检查。下面用几个例子分别说明。
-
-### 方式一：`default()` 自动推断
-
-`default(30)` 类型检查器会看到 `ConfigItemProxy[int]`，链式调用 `.get()` 返回 `int`。
+`default()` 会推断类型，让 IDE 和类型检查器认得 `.get()` 的返回值和 `.set()` 的参数：
 
 ```python
 class AppKeys(ConfigKeysBase):
     timeout  = default(30)          # ConfigItemProxy[int]
     app_name = default("myapp")     # ConfigItemProxy[str]
-    debug    = default(False)       # ConfigItemProxy[bool]
+    id_list  = default(None, list)  # ConfigItemProxy[list | None]
 
-class AppConfig(Config, AppKeys):
-    ...
-
-cfg = AppConfig(file_name="app")
-
-n: int = cfg.timeout.get()          # ✅ 类型检查通过
-cfg.timeout.set(60)                 # ✅ int，通过
-cfg.timeout.set("oops")             # ❌ 类型检查报错：期望 int，收到 str
+n: int = cfg.timeout.get()          # 通过
+cfg.timeout.set(60)                 # 通过
+cfg.timeout.set("oops")             # 类型检查报错
 ```
 
-### 方式二：`default(None, type)` 声明可空类型
-
-第一个参数为 `None` 时，第二个参数提供类型信息，推断结果为 `ConfigItemProxy[T | None]`。
+`default(None, type)` 表示可空，第二个参数提供类型。元素类型也要精确时可以写注解：
 
 ```python
-class AppKeys(ConfigKeysBase):
-    id_list = default(None, list)     # ConfigItemProxy[list | None]
-    mapping = default(None, dict)     # ConfigItemProxy[dict | None]
-    name    = default(None, str)      # ConfigItemProxy[str | None]
-
-class AppConfig(Config, AppKeys):
-    ...
-
-cfg = AppConfig(file_name="app")
-
-# IDE 会提示 get() 可能是 None，需要判空
-value = cfg.id_list.get()             # Optional[list]
-if value is not None:
-    value.append(1)                    # ✅ 收窄为 list
-
-cfg.id_list.set(None)                  # ✅ None 允许
-cfg.id_list.set([1, 2, 3])             # ✅ list 也允许
-cfg.id_list.set("oops")                # ❌ 报错
-```
-
-### 方式三：显式 `ConfigItemProxy[T]` 注解
-
-需要更精确的类型（例如带元素类型的列表）时，直接写注解。
-
-```python
-from xiaoe_config_manager import Config, ConfigItemProxy, ConfigKeysBase, default
 from typing import Optional
 
 class AppKeys(ConfigKeysBase):
-    # 更精确的元素类型
-    ports:  ConfigItemProxy[list[int]]           = default(None, list)
-    names:  ConfigItemProxy[list[str]]           = default(None, list)
-    # 可空 + 精确元素类型
-    tags:   ConfigItemProxy[Optional[list[str]]] = default(None, list)
-    # 字典
-    routes: ConfigItemProxy[dict[str, str]]      = default(None, dict)
-
-class AppConfig(Config, AppKeys):
-    ...
-
-cfg = AppConfig(file_name="app")
-ports = cfg.ports.get()                # Optional[list[int]]
+    ports: ConfigItemProxy[list[int]]           = default(None, list)
+    tags:  ConfigItemProxy[Optional[list[str]]] = default(None, list)
 ```
 
-### 方式四：省略 `default()` 直接写裸值
+也可以只写裸值（`timeout = 30`），运行时行为完全一样，但点键访问就没有静态检查了。
 
-也可以只写裸值，运行时行为完全一样，但 IDE 只看到原始类型，点操作的 `.get()` 不会被静态检查。
+建议始终用 `default()`。
+
+## 订阅与通知
 
 ```python
-class AppKeys(ConfigKeysBase):
-    timeout  = 30                      # IDE 看到的是 int，而非 ConfigItemProxy[int]
-    app_name = "myapp"                 # IDE 看到的是 str
-
-class AppConfig(Config, AppKeys):
-    ...
-
-cfg = AppConfig(file_name="app")
-cfg.timeout.get()                      # 运行时正常，但没有类型检查与补全
-cfg.timeout.set("oops")                # 运行时才报错
+cfg.on("timeout", lambda v: print("变了", v))       # 单键
+cfg.value_changed(lambda k, v: print(k, v))         # 所有键
+cfg.off("timeout", 回调)                            # 取消单键，要同一个函数引用
+cfg.off_value_changed(回调)                         # 取消全键
 ```
 
-> 推荐始终使用 `default()` 或 `ConfigItemProxy[T]`，让 IDE 全程有提示。
+`off` 和 `off_value_changed` 的取向一致：注销一个没注册过的回调抛 `ValueError`。例外是键本身从未出现过，`off` 对这种情况直接返回。
 
-### IDE 补全效果
+通知怎么来的，分几种情况：
 
-```python
-cfg.timeout.          # 补全：get / set / reset / on / off
-cfg.app_name.s        # 补全：set
-cfg.timeout.get()     # 返回类型：int
-```
+| 场景                     | 派发方式                                          |
+|------------------------|-----------------------------------------------|
+| 本进程 `set`              | 当场派发，`set` 返回时值已生效                            |
+| 本进程 `reset`（文件版 / 内存版） | 当场派发新值，`reset` 返回时监听器已经跑完                      |
+| 本进程 `reset`（子进程管道）     | **不**当场派发；`RESET` 广播到达时才派发一次，派发的是正确的新值         |
+| `reset("all")`         | 派发一次 `("all", 整份 dict)`，三个后端一致                 |
+| 别的进程改了                 | 主进程只发变了的那个键，子进程更新本地缓存后派发它                     |
+| 自己写出去又广播回来的回声          | `set` 的回声不派发（缓存早已乐观写过）；`reset` 的回声要派发（见下）    |
+
+三个后端的**派发次数和内容完全一致**：一次写就是一次通知，哪怕值没变，哪怕别人写了个和自己相同的值。子进程靠消息里的 `origin`（发起者 ID）忽略set自己的回声。
+
+> **管道里的 `reset` 是异步的**：`cfg.reset("speed")` 返回时，监听器**还没被调用**，因为本地缓存要等主进程把新值广播回来才更新。文件版和内存版则是同步的，`reset` 返回时监听器已经跑完了。
+>
+> 不要写这种断言：
+>
+> ```python
+> cfg.reset("speed") # ConfigInChildProcessPipe 实例
+> assert hits == [50]        # ❌ 管道里此时 hits 还是空的，需等一小段时间。
+> ```
+>
+> 要么等通知（在回调里继续），要么轮询到值变了为止。`set` 不受影响 —— 它是乐观写，返回时值已生效、通知也已派发。
+>
+> 为什么 `reset` 不干脆当场派发旧值：那会让监听器收到"旧值 → 新值"两次通知，和另两个后端的"一次重置一次通知"就对不上了。
+
+派发点只有 `ConfigBase._dispatch` 一处。要接管通知（比如 Qt 把回调排队回自己的线程），重写这一个方法就够了，不要在别处另发通知。
+
+单个回调抛异常不会影响别的回调，也不会冒给 `set` / `reset` 的调用方。异常会打一份堆栈后继续，走的是 `traceback.print_exc()`，所以 `sys.excepthook` 收不到这份。打包成 `console=False` 之后 stderr 是空的，想在发行版里看见，就重写 `_report_listener_error(key, callback)` 接到自己的错误上报里。
 
 ## 数据安全
 
-这一节的三条是**故障链上的三道闸**，都别绕过。
-
-### 1. 坏文件报错，绝不覆盖
-
-`Config(...)` 捕获的**只有 `FileNotFoundError`**（第一次运行还没有文件，此时兜底成空配置）。
-文件损坏、编码错、没权限 —— 一律**原样抛异常**：
+**坏文件就报错，不覆盖。** `Config(...)` 只把 `FileNotFoundError` 当成"第一次运行、还没有文件"。文件损坏、编码不对、没有权限，一律原样抛出，此时文件一个字节都不会变，也不会留下临时文件：
 
 ```python
 # app.json 里是 "{ 这不是 JSON "
@@ -272,284 +192,139 @@ Config("app", default_config={"a": 1})
 # json.JSONDecodeError: Expecting property name enclosed in double quotes: ...
 ```
 
-抛异常时**文件一个字节都不会变**，也不会留下 `.tmp`。
+**落盘是延迟加原子写。** `set` 只改内存并重置一个 `save_delay` 秒（默认 0.5）的定时器，窗口内多次写只落盘一次。真正写文件时先写一个唯一命名的临时文件，再 `os.replace` 替换，替换遇到 Windows 上常见的瞬时 `PermissionError` 会退避重试。
+如果直接以 `'w'` 打开原文件写，一旦序列化失败就会把文件截断成半截。
 
-> 为什么这么严：以前这里把坏文件吞成空配置，紧接着 `__init__` 用默认值补缺并
-> `_save()` 落盘 —— 用户原来的配置**永久消失，且没有任何提示**。报错比静默丢数据好。
+`reset`、`get('all')`、`flush()` 和进程正常退出（`atexit`）都会强制把待落盘的改动写出去。`flush()` 幂等，退出前、交给外部工具读之前、fork 之前都值得调一次。进程被强杀时 `atexit` 不跑，窗口内的改动会丢。
 
-### 2. 落盘是延迟 + 原子写
+## 多进程
 
-`set` 不立刻落盘 —— 它只改内存、重置一个 `save_delay` 秒的定时器：
-
-```python
-def _save(self):                 # 调用方已持 config_lock
-    self._dirty = True
-    if self._save_delay <= 0:
-        self._flush_locked() # 直接调用原子写入
-        return
-    if self._save_timer is not None:
-        self._save_timer.cancel()
-    t = threading.Timer(self._save_delay, self.flush) # 定时器结束后调用原子写入
-    t.daemon = True
-    self._save_timer = t
-    t.start()
-
- def _atomic_write(self) -> None:
-     """原子落盘：唯一临时名 + 写完替换（带重试）。
-     """
-     directory = os.path.dirname(self.path) or "."
-     fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".cfg-", suffix=".tmp")
-     try:
-         with os.fdopen(fd, 'w', encoding='UTF-8') as f:
-             json.dump(self.config, f, indent=4, ensure_ascii=False)
-         _replace_with_retry(tmp_path, self.path)
-     except BaseException:
-         try:
-             os.unlink(tmp_path)
-         except OSError:
-             pass
-         raise
-
-def _replace_with_retry(src: str, dst: str, tries: int = 8) -> None:
-    """``os.replace`` + 退避重试，专治 Windows 瞬时 ``PermissionError``。
-    """
-    delay = 0.02
-    for i in range(tries):
-        try:
-            os.replace(src, dst)
-            return
-        except PermissionError:
-            if i == tries - 1:
-                raise
-            time.sleep(delay)
-            delay = min(delay * 2, 0.5)
-```
-
-直接以 `'w'` 打开原文件写，会在序列化失败时把文件**截断成半截**
-（不可序列化的类型、磁盘写满），下次启动就是坏配置 —— 那正是上面那一步的起点。
-现在的形式下，任何一步失败，原文件都还是完整的旧内容。
-
-配套的一条：`DATA_TYPES` **故意不含 `set`**。`set` 过得了声明校验，却会让
-`json.dump` 在文件被截断之后失败 —— 就是从这一步开始的。
-
-### 3. `get('all')` 会重读文件并替换内存副本
-
-这是**有意的副作用**（见 [API 参考](#config)）：文件版 `get('all')` 从磁盘重读，
-把 `self.config` 换成文件里的内容。好处是别人刚写进去的值能看到；代价是本进程
-未落盘的中间状态会被覆盖。要读单键就用 `get(key)`，它只读内存副本。
-
-## 多进程使用
-
-多进程场景下，**主进程持有 `Config` 单例**，每个子进程在主进程侧对应一个
-`ConfigInMainProcessPipe`。子进程通过 `ConfigInChildProcessPipe` 与主进程通信。
-
-由于 `ConfigInChildProcessPipe` 不是 `Config` 的子类，主进程和子进程无法从同一个
-`Config` 子类继承。此时把**配置声明单独抽成一个纯声明类**（例如 `AppKeys`），
-主进程与子进程分别继承它，两边共享同一套键名与类型信息。
-
-### 共享声明 + 主进程 + 子进程
+多进程场景下，主进程持有 `Config` 单例，每个子进程在主进程侧对应一个 `ConfigInMainProcessPipe`，子进程自己用 `ConfigInChildProcessPipe` 通信。
 
 ```python
 import multiprocessing as mp
-import time
+import threading
 
 from xiaoe_config_manager import (
     Config, ConfigInMainProcessPipe, ConfigInChildProcessPipe,
     ConfigKeysBase, default,
 )
 
-
-# ── 1. 共享声明：只放「键名 = 默认值」──
 class AppKeys(ConfigKeysBase):
+    """主进程和子进程共用同一份声明。"""
     workers       = default(4)
     worker_status = default(None, str)
     master_status = default(None, str)
 
 
-# ── 2. 主进程：Config + 同一份声明 ──
-class AppConfig(Config, AppKeys):
-    ...
-
-
-# ── 3. 子进程：ConfigInChildProcessPipe + 同一份声明 ──
 def worker(set_q, get_q):
-    class AppConfigChild(ConfigInChildProcessPipe, AppKeys):
+
+    class AppConfigChild(ConfigInChildProcessPipe, AppKeys):  # 子进程中组合 Config、Keys
         ...
 
-    cfg = AppConfigChild(set_q, get_q)      # 构造时就同步到第一份配置
-    print("子进程读到 workers =", cfg.workers.get())        # 4
+    # 子进程中使用传入的管道创建子进程配置实例，接口、对外行为、用法几乎与主进程的Config类一致
+    cfg = AppConfigChild(set_q, get_q)
+    print("子进程读到 workers =", cfg.workers.get())
 
-    # 订阅：单键 / 所有键。跨进程的变更会自动派发到这里。
-    cfg.worker_status.on(lambda v: print("子进程自己写的 worker_status =", v))
-    cfg.value_changed(lambda k, v: print("子进程收到变更:", k, "=", v))
+    got_ok = threading.Event()
 
-    cfg.worker_status.set("running")        # 乐观写：本地立即生效，消息发给主进程
+    def on_master(value):
+        print("子进程收到 master_status =", value)
+        got_ok.set()                      # 回调里放行主线程
 
-    # 等主进程那一发广播（真实程序里不用这样等：Qt 事件循环会替你跑）
-    for _ in range(100):
-        if cfg.master_status.get() == "ok":
-            break
-        time.sleep(0.05)
-    print("子进程看到 master_status =", cfg.master_status.get())
+    cfg.master_status.on(on_master)        # 主进程写 master_status 时回调这里
+
+    cfg.worker_status.set("running")       # 乐观写：本地立即生效，再同步给主进程
+
+    if not got_ok.wait(timeout=5):         # 等回调，不轮询
+        print("子进程等 master_status 超时")
 
     cfg.close()
 
-
 if __name__ == "__main__":
-    cfg = AppConfig(file_name="my_config")
 
-    # 主进程的订阅也是自动的：子进程写进来就派发
-    cfg.on("worker_status", lambda v: print("主进程收到 worker_status =", v))
+    class AppConfig(Config, AppKeys):... # 主进程中组合Config、Keys
+    cfg = AppConfig(file_name="my_config") # 主进程中持Config单例，负责统一处理文件、广播
 
-    main_pipe = ConfigInMainProcessPipe(cfg)      # 每个子进程一个
+    got_running = threading.Event()
+
+    def on_worker(value):
+        print("主进程收到 worker_status =", value)
+        got_running.set()                  # 回调里放行主线程
+
+    cfg.worker_status.on(on_worker)        # 子进程写 worker_status 时回调这里
+
+    main_pipe = ConfigInMainProcessPipe(cfg)    # 为每个子进程一个MainProcessPipe
+
+    # 获取管道并传给子进程
     set_q, get_q = main_pipe.get_queues()
 
     p = mp.Process(target=worker, args=(set_q, get_q))
     p.start()
 
-    # 等子进程把 worker_status 写进来（真实程序里靠上面的订阅回调，不用轮询）
-    for _ in range(100):
-        if cfg.worker_status.get() == "running":
-            break
-        time.sleep(0.05)
+    if not got_running.wait(timeout=5):    # 等回调，不轮询
+        print("主进程等 worker_status 超时")
 
-    cfg.master_status.set("ok")     # 主进程写：当场派发，并广播给所有子进程
+    cfg.master_status.set("ok")             # 当场派发，并广播给所有子进程
     p.join()
 
     print("主进程最终配置 =", cfg.get("all"))
     main_pipe.close()
 ```
 
-输出：
+子进程中set一个配置时的数据流：
 
 ```text
-子进程读到 workers = 4
-子进程自己写的 worker_status = running
-子进程收到变更: worker_status = running
-子进程收到变更: master_status = ok
-子进程看到 master_status = ok
-主进程收到 worker_status = running
-主进程最终配置 = {'workers': 4, 'worker_status': 'running', 'master_status': 'ok'}
+子进程 set(v) ──→ 改自己的副本 ──→ set_queue ──→ 主进程 _loop() ──→ Config.set()
+                                                                     │
+                                                                     ▼
+                                                    get_queue（只发这一个键）
+                                                                     │
+                                                                     ▼
+                                                 子进程改本地缓存 → 派发这一个键
 ```
 
-### 为什么需要 `AppKeys`
+子进程的 `set` 不写文件，把请求交给主进程；`reset` 同样只发消息。主进程统一处理所有写和文件 IO，改完把**变了的那个键**发给所有子进程。子进程的 `get` 读本地缓存，没有跨进程开销。每个子进程需要独立的一对队列，也就是一个 `ConfigInMainProcessPipe` 配一个 `ConfigInChildProcessPipe`。
 
-- `ConfigDeclareMixin` 在**每一个继承它的子类**上单独生成点操作属性
-- 主进程的 `AppConfig` 与子进程的 `AppConfigChild` 是**两个不同的子类**，各自需要一份声明
-- 把声明抽到 `AppKeys`，一次编写两处继承，键名、默认值、类型注解三方面都不会漂移
-- 单进程场景只有一个类，直接 `class AppConfig(Config, AppKeys)` 就够了，不必刻意拆
+只有两种时候会传整份配置：子进程启动时向主进程要一份（拉取），以及 `reset("all")` 之后键集合整体变了、没法只发一个键（推送）。其余时候线上跑的都只有一个键。
 
-### 通知是自动的
+子进程构造时会向主进程要一份完整配置并等它回来，等 30 秒还没到就抛 `RuntimeError`，通常意味着主进程的 `ConfigInMainProcessPipe` 还没起来，或者管道对象传错了。
 
-**不需要手工接线** —— `on_remote_change` / `off_remote_change` 已经删除，
-`notify_change`（ui 侧）也删了。直接 `cfg.on(key, cb)` / `cfg.value_changed(cb)` 就行
-（取消订阅分别是 `cfg.off(key, cb)` / `cfg.off_value_changed(cb)`）：
-
-| 场景 | 派发方式 |
-|---|---|
-| 本进程 `set` | 当场派发（`set` 返回时值已生效） |
-| 本进程 `reset`（文件版 / 内存版） | 当场派发新值 |
-| 本进程 `reset`（子进程管道） | **悲观**：当场那一发可能还是旧值，广播回来时再按 diff 派发正确的新值 |
-| 别的进程改了 → 广播回来 | 按**逐键 diff** 派发，只报真的变了的键 |
-| 子进程写完、主进程广播回来的**回声** | 被 diff 吞掉（`before == after`），**不会双发** |
-| 主进程处理子进程的写入 | 走 `Config.set`，派发点只有 `ConfigBase._dispatch` 一处，也不会双发 |
-
-### 架构说明
-
-```text
-子进程 cfg.set(v) ──→ set_queue ──→ 主进程 _loop() ──→ Config.set()
-                                                          │
-                                                          ▼
-                                                   config_get_queue（整份 config）
-                                                          │
-                                                          ▼
-                                          子进程 _update_config_loop()
-                                          替换本地缓存 → diff_changes() → _dispatch()
-```
-
-- 子进程的 `set()` 不直接写文件，通过队列把请求交给主进程；`reset()` 同样只发消息
-- 主进程统一处理所有写操作和文件 I/O，修改后通过广播队列通知所有子进程
-- 子进程的 `get()` 从本地缓存读取，零跨进程开销
-- 每个子进程需要**独立的**一对队列（一个 `ConfigInMainProcessPipe` + 一个 `ConfigInChildProcessPipe`）
+用完记得调 `close()`：主进程和子进程两侧都要调，否则守护线程不会正常退出。
 
 ## 内存版
 
-内存版和文件版**用同一种方式创建 —— 定义类**：继承 `ConfigMemory` 并把声明类接上；
-不传参数就用声明的默认值，传一个 dict 就盖在上面。区别只有 `fname is None`（不落盘）。
+内存版（ConfigMemory）和文件版（Config类）的api、对外行为、用法几乎一致，区别就是没有文件读写。
+
+当然，你也可以接入`ConfigInMainProcessPipe`+`ConfigInChildProcessPipe`实现内存配置的多进程同步。
 
 ```python
-from xiaoe_config_manager import Config, ConfigKeysBase, ConfigMemory, default
+from xiaoe_config_manager import ConfigKeysBase, ConfigMemory, default
 
 class AppKeys(ConfigKeysBase):
     enable = default(False)
     speed  = default(50)
 
-class AppMemory(ConfigMemory, AppKeys):     # 内存版：类 + 不传
+class AppMemory(ConfigMemory, AppKeys):
     ...
 
-mem = AppMemory()                   # 声明里的默认值
-mem.speed.get()                     # 50
-mem.speed.set(60)                   # 只改内存，没有文件
-mem.speed.get()                     # 60
-mem.speed.reset()                   # 回到 50
+mem = AppMemory()               # 用声明里的默认值
+mem.speed.get()                 # 50
+mem.speed.set(60)               # 只改内存
+mem.speed.reset()               # 回到 50
 
-mem2 = AppMemory({"speed": 99})     # 类 + 一份 dict：盖在声明默认值上面，同时是 reset 目标
-mem2.speed.get()                    # 99
-mem2.enable.get()                   # False（声明里的值还在）
-
-class AppConfig(Config, AppKeys):   # 文件版：类 + 路径
-    ...
-
-cfg = AppConfig("app")
+mem2 = AppMemory({"speed": 99}) # 一份 dict 盖在声明默认值上面，同时是 reset 目标
 ```
-
-`ConfigMemory.__init__(data=None)` 会**先把类声明的默认值合进来** ——
-`{**type(self).DEFAULTS, **data}` —— 所以 `AppMemory()` 拿到全部声明键与默认值，
-与文件版 `AppConfig(路径)` 对称；`data` **既是初始值、也是 reset 的目标**
-（和文件版「`default_config` 交给后端」是一个道理）；`fname is None`，`_save` 是空实现。
-
-> **只接受一个 dict**：`AppMemory(speed=60)` 这种关键字覆盖会当场 `TypeError`。
-
-**内存版没有例外**：`get(缺键)` 和文件版一样抛 `KeyError`；读出来 / 写进去的都是
-**深拷贝**（嵌套的 list / dict 也不跟调用方共享）。
-"读一个可能没有的键"是**读的一方**的事，不该让配置对象替它兜底 ——
-否则拼错的键名又变成静默 `None`。读的一方想要默认值就自己接住：
-
-```python
-try:
-    speed = mem.get("speed")
-except KeyError:
-    speed = 60
-```
-
-其余照旧 —— `get('all')` 返回内存快照的副本，`reset(缺键)` 抛 `KeyError`。
-
-### 兼容 / 快速路径：`memory()`
-
-`Config.memory({...})` / `AppConfig.memory()` **仍然可用、行为不变**，但它是**便捷路径**：
-适合「临时配置、不想为它写一个类」或者「老代码兼容」，只是替你省掉写类这一步。
-
-```python
-mem = AppConfig.memory()                # ≡ AppMemory()，默认值来自声明
-mem = AppConfig.memory({"speed": 99})   # dict 盖在声明值上面，同时是 reset 目标
-mem = ConfigMemory({"speed": 50})       # 连声明都没有时的裸写法
-```
-
-**要正经当一个配置用（多键、要 reset 语义、要 IDE 补全）就定义类** ——
-点操作是靠**类创建时**按 `cls.DEFAULTS` 装 property 生成的，所以"要顺手的点操作"
-天然对应"有个类"。（`memory()` 内部照 `cls.DEFAULTS` 合成一个临时声明类，
-所以它返回的实例**也带点操作**。）
 
 ## 动态默认值
 
-`default_config_callback` 允许在初始化时和重置时动态生成默认值。
+`default_config_callback` 让你在初始化和重置时动态生成默认值：
 
 ```python
+import socket
 from xiaoe_config_manager import Config
 
 def dynamic_defaults(current_config):
-    """根据当前环境动态生成默认值。"""
-    import socket
     return {
         "host":         "0.0.0.0",
         "port":         8080,
@@ -562,75 +337,43 @@ cfg = Config(
     default_config={"host": "0.0.0.0", "port": 8080,
                     "hostname": "", "worker_count": 4},
     default_config_callback=dynamic_defaults,
-    init_use_callback=True,     # 初始化时调用回调
+    init_use_callback=True,
 )
 
-# 重置时会再次调用回调，获取最新的默认值
-cfg.reset("all")
+cfg.reset("all")    # 重置时会重新调用回调
 ```
 
-初始化时默认值的优先级（**与代码一致**的说法）：
-
-```text
-default_config_callback（仅 init_use_callback=True） > default_config > 类声明的 DEFAULTS
-```
-
-也就是说：显式传了 `default_config` 时，声明里的默认值**不参与**
-（要合并请自己合，别指望隐式规则）。
+初始化时默认值的优先级是：`default_config_callback`（仅当 `init_use_callback=True`）高于 `default_config`，`default_config` 高于类声明的 `DEFAULTS`。也就是说，显式传了 `default_config` 时声明里的默认值不参与，要合并请自己合。
 
 ## API 参考
 
 ### ConfigApi
 
-统一接口（`ABC`），所有配置对象都是它的实现。
+三个后端的统一接口（Config、ConfigInChildProcessPipe、ConfigMemory）。
 
-| 成员 | 类型 | 说明 |
-|---|---|---|
-| `get(key)` | 抽象 | 读一个键；`key="all"` 返回整份配置 dict。缺键抛 `KeyError`（所有后端一致）。返回**深拷贝** |
-| `set(key, value)` | 抽象 | 写一个键（存**深拷贝**）。返回时值已生效。`key="all"` 抛 `TypeError` —— 它是 `get('all')` / `reset('all')` 专用的特殊键名，不对应任何单个配置项 |
-| `reset(key)` | 抽象 | 恢复默认值；`key="all"` 恢复全部 |
-| `on(key, cb)` | 抽象 | 单键订阅，`cb(value)` |
-| `off(key, cb)` | 抽象 | 取消单键订阅（同一个函数引用）。键在、回调不在 → `ValueError`；键没出现过 → 静默 |
-| `value_changed(cb)` | 抽象 | 订阅**所有键**，`cb(key, value)` |
-| `off_value_changed(cb)` | 抽象 | 取消 `value_changed` 注册的回调（同一个函数引用）。**回调不在订阅列表里 → `ValueError`**（与 `off` 同一取向：注销没注册过的回调不静默） |
-| `configget(key)` | 具体 | `get` 的老名字，转发到 `get` |
-| `configset(key, value)` | 具体 | `set` 的老名字，转发到 `set` |
-| `configreset(key)` | 具体 | `reset` 的老名字，转发到 `reset` |
-
-> manager 侧 `value_changed` 是**方法**（`cfg.value_changed(cb)`，取消订阅 `cfg.off_value_changed(cb)`）；
-> `xiaoe_ui` 的桥把同一个名字实现成 **Qt 信号**（`cfg.value_changed.connect(slot)`，取消订阅 `.disconnect(slot)`）——
-> **桥实例上够不到 `off_value_changed`**（桥的通知走 Qt 信号，全键订阅列表永远是空的，调它必然 `ValueError`）。
-
-> **派发是逐条隔离的**：`ConfigBase._dispatch` 对每一条回调单独 `try/except` —— 一个回调抛异常
-> 只打一份堆栈（`_report_listener_error`）、**其余回调照常跑**，也**不会**冒给 `set()` / `reset()`
-> 的调用方（值那时已经落盘了）。打堆栈走的是 `traceback.print_exc()`，**`sys.excepthook` /
-> `threading.excepthook` 接不到这一份**（实测：装了 `error_report.install_global_hooks()` 之后，
-> 回调抛异常时 `error.log` 依然不多一行）；`console=False` 打包后 `sys.stderr is None`，
-> 这一份堆栈就等于没有 —— 想在发行版里看见，就重写
-> `ConfigBase._report_listener_error(key, callback)` 接到自己的错误上报里。
-> （`xiaoe_ui` 的桥是另一条路：Qt 信号槽的异常由 PySide 用 `PyErr_Print()` 打出，那条路**会**走
-> `sys.excepthook`；两边对调用方的表现仍然一致 —— 都只是打一份然后继续。）
+| 成员 | 说明 |
+|---|---|
+| `get(key)` | 读一个键，`key="all"` 返回整份 dict，缺键抛 `KeyError`，返回值是深拷贝 |
+| `set(key, value)` | 写一个键，存的是深拷贝。返回时值已生效。`key="all"` 抛 `TypeError` |
+| `reset(key)` | 恢复默认值，`key="all"` 恢复全部 |
+| `on(key, cb)` / `off(key, cb)` | 单键订阅，回调签名 `(value)` |
+| `value_changed(cb)` / `off_value_changed(cb)` | 全键订阅，回调签名 `(key, value)` |
 
 ### ConfigBase
 
-**行为层**：模板方法、订阅、锁、广播、唯一派发点都在这里。
-`Config`（文件版）与 `ConfigMemory`（内存版）是它的**平级兄弟**。
+行为层，模板方法、订阅、锁、广播、唯一派发点都在这里。`Config` 和 `ConfigMemory` 是它的平级子类，子进程管道也继承它。
 
-| 方法                                                   | 说明                                                                                                     |
-|------------------------------------------------------|--------------------------------------------------------------------------------------------------------|
-| `get` / `set` / `reset`                              | 标准三件套模板：加锁 → 子类存储原语 → 落盘/广播 → 解锁 → `_dispatch()`                                                       |
-| `on` / `off` / `value_changed` / `off_value_changed` | 订阅（`_dispatch` 逐条隔离：一个回调炸了不影响其余）                                                                       |
-| `_dispatch(key, value)`                              | **唯一派发点**。要接管通知（例如 Qt 桥排队回本线程），重写这一个方法                                                                 |
-| `memory(defaults=None)`                              | 类方法，**兼容 / 快速路径**：造一个内存版的自己（内部按 `cls.DEFAULTS` 合成临时声明类）。正经配置请定义类：`class AppMem(ConfigMemory, AppKeys)` |
-| `update_config()`                                    | 把当前配置推给所有注册过的子进程队列（没队列就是空操作）                                                                           |
-| `configupdate_config(key, last_value=None)`          | 默认值热更新                                                                                                 |
-| `item(key)`                                          | 取一个显式代理（未声明的键 / 撞保留字的键走这条）                                                                             |
+子类只需要实现五个方法：`_read`、`_read_all`、`_write`、`_apply_reset`、`_save`（内存版和管道的 `_save` 是空实现）。`set` 和 `reset` 负责加锁、调这些方法、落盘广播、解锁、派发，所以"写完必须派发一次"这条纪律只有一处实现。
 
-子类只需要实现五个存储原语：`_read` / `_read_all` / `_write` / `_apply_reset` / `_save`。
+| 方法 | 说明 |
+|---|---|
+| `_dispatch(key, value)` | 唯一派发点，要接管通知就重写它 |
+| `memory(defaults=None)` | 类方法，造一个内存版的自己，见「内存版」 |
+| `update_config()` | 把当前配置推给所有注册过的子进程队列 |
+| `configupdate_config(key, last_value=None)` | 默认值热更新，用户没改过该键时同步成新默认值。需要预置 `"{key}_reseted": False` 标记，缺了抛 `KeyError` |
+| `item(key)` | 取一个显式字段句柄 |
 
 ### Config
-
-文件版核心类，管理 JSON 文件的读写。
 
 ```python
 Config(
@@ -638,148 +381,102 @@ Config(
     default_config=None,
     default_config_callback=None,
     init_use_callback=True,
+    save_delay=0.5,
+    save_on_exit=True,
 )
 ```
 
-| 参数                        | 类型         | 默认值        | 说明                                           |
-|---------------------------|------------|------------|----------------------------------------------|
-| `file_name`               | `str`      | `"config"` | 配置文件名，不含 `.json`                             |
-| `default_config`          | `dict`     | `None`     | 默认配置字典，缺失的 key 自动补齐                          |
-| `default_config_callback` | `Callable` | `None`     | 默认配置回调，接受当前 config 字典作为参数，重置时再次调用            |
-| `init_use_callback`       | `bool`     | `True`     | 初始化时是否用回调拿默认配置                               |
-| `save_delay`              | `float`    | `0.5`      | set 后延迟多久落盘。窗口内多次 set 只写一次。<= 0 表示每次 set 立即写 |
-| `save_on_exit`	           | `bool`	    | `True`	    | 是否注册 atexit，在进程正常退出时自动 flush                 |
+| 参数 | 说明 |
+|---|---|
+| `file_name` | 配置文件名，不含 `.json` |
+| `default_config` | 静态默认值，缺失的键自动补齐 |
+| `default_config_callback` | 动态默认值回调，参数是当前配置，重置时再次调用 |
+| `init_use_callback` | 初始化时是否用回调拿默认值 |
+| `save_delay` | `set` 后延迟多少秒落盘，窗口内多次写合并成一次。`<= 0` 表示每次立即写 |
+| `save_on_exit` | 是否注册 `atexit`，进程正常退出时自动 flush |
 
-**方法：**
+行为要点：
 
-| 方法                                                              | 说明                                                                         |
-|-----------------------------------------------------------------|----------------------------------------------------------------------------|
-| `get(key)`                                                      | 获取配置值。`key="all"` 从文件重读并**替换内存副本**，返回全部配置字典；缺键抛 `KeyError`                 |
-| `set(key, value)`                                               | 设置配置值，自动写文件并广播，然后派发通知                                                      |
-| `reset(key)`                                                    | 恢复默认值。`key="all"` 恢复全部                                                     |
-| `configget(key)` / `configset(key, value)` / `configreset(key)` | 老名字，转发到上面三个                                                                |
-| `configupdate_config(key, last_value=None)`                     | 默认值热更新。用户未修改过该 key 时同步为新默认值。需预置 `"{key}_reseted": False` 标记，缺了抛 `KeyError` |
-| `update_config()`                                               | 向所有注册的子进程广播当前配置                                                            |
-| `path`                                                          | property，`"<file_name>.json"`                                              |
-| `flush()`                                                       | 立刻把待落盘的改动写出（取消定时器 + _atomic_write）。幂等，可重复调。退出前、交给外部工具读之前、fork 之前调          |
-
-**行为要点：**
-
-- 构造时只捕 `FileNotFoundError`；其余异常上抛，坏文件不被覆盖
-- 配置项缺的键会自动补进文件（只补缺的，不覆盖已有的）
-- 落盘是原子写
-- `set` **延迟落盘**：改内存 + 重置定时器，`save_delay` 秒后才真正写文件；窗口内多次写合并成一次
-- `reset` **立即落盘**：不走延迟，写失败会打堆栈、保留 `_dirty`，下次 flush 重试
-- `get('all')` 会**先 flush 再重读文件**（见「数据安全」第 3 条）—— 等于强制同步一次
-- 进程正常退出（`atexit`）时自动 `flush`
+- 构造时只捕 `FileNotFoundError`，其余异常上抛，坏文件不被覆盖
+- 缺的键自动补进文件，只补缺的，不覆盖已有的
+- `set` 延迟落盘，`reset` 立即落盘（写失败会打堆栈、保留待写标记，下次 flush 重试）
+- `get('all')` 先 flush 再重读文件，等于强制同步一次
+- `path` 是 `"<file_name>.json"`，父目录必须已存在，这个类不建目录
 
 ### ConfigMemory
 
-内存版后端。和文件版一样用**定义类**创建，也是对等的第二个后端（`ConfigBase` 的平级兄弟）：
+| 项 | 说明                        |
+|---|---------------------------|
+| `ConfigMemory(default_config=None)` | 配置初始值                     |
+| `get(缺键)` / `reset(缺键)` | 抛 `KeyError`，与文件版一致       |
+| `get('all')` | 返回整份配置的深拷贝                |
+| `set(key, value)` | `key="all"` 抛 `TypeError` |
 
-```python
-class AppMemory(ConfigMemory, AppKeys):     # 类 + 声明
-    ...
-
-mem = AppMemory()                           # 用声明的默认值
-mem = AppMemory({"speed": 60})              # 一份 dict 盖在声明默认值上面
-```
-
-| 项 | 说明 |
-|------|------|
-| `ConfigMemory(data=None)` | 构造函数：`{**type(self).DEFAULTS, **data}` —— 声明默认值先合进来；`data` 既是初始值也是 reset 目标（存**深拷贝**，之后改 `data` 不影响配置）。**只接受一个 dict，不支持关键字覆盖** |
-| `fname` | `None`（没有文件）；`_save` 是空实现 |
-| `get(缺键)` | 抛 `KeyError`（与文件版一致，内存版没有例外） |
-| `get('all')` | 返回整份配置的**深拷贝** |
-| `set(key, value)` | `key="all"` 抛 `TypeError`（保留键名） |
-| `reset(缺键)` | 抛 `KeyError` |
-| 其余 | 与文件版一致 |
-| `Config.memory(...)` / `AppConfig.memory()` | **兼容 / 快速路径**（行为不变）：临时配置不想写类时用它。有声明键时返回 `ConfigMemory` 的一个合成子类（点操作照带） |
-
-### ConfigKeysBase / ConfigDeclareMixin / ConfigItemProxy[T]
+### ConfigKeysBase / ConfigDeclareMixin / ConfigItemProxy
 
 | 名字 | 说明 |
-|------|------|
-| `ConfigKeysBase` | 纯声明基类，`DEFAULTS` 是普通 dict，可以被任何后端消费 |
-| `ConfigDeclareMixin` | 把声明键变成实例上的 property。`ConfigBase` 已继承 |
-| `ConfigItemProxy[T]` | 点操作代理，提供 `.get() / .set(v) / .reset() / .on(cb) / .off(cb)` 和 `.key` |
+|---|---|
+| `ConfigKeysBase` | 纯声明基类，`DEFAULTS` 是普通 dict，任何后端都能消费 |
+| `ConfigDeclareMixin` | 把声明键做成实例上的 property，`ConfigBase` 已继承 |
+| `ConfigItemProxy[T]` | 字段句柄，有 `.get()` / `.set(v)` / `.reset()` / `.on(cb)` / `.off(cb)` 和 `.key` |
 | `collect_defaults(cls)` | 扫出一个类认哪些键、默认值各是多少 |
-| `default(value)` / `default(None, type_)` | 声明默认值的辅助函数，也承担类型推断 |
+| `default(value)` / `default(None, type_)` | 声明默认值，同时承担类型推断 |
 
-`ConfigItemProxy` 由 `ConfigDeclareMixin` 通过类属性自动生成，
-**不能在代码里手动实例化**。
-
-### default
-
-```python
-default(30)              # 推断为 ConfigItemProxy[int]
-default("myapp")         # 推断为 ConfigItemProxy[str]
-default(None, list)      # 推断为 ConfigItemProxy[list | None]
-default(None, dict)      # 推断为 ConfigItemProxy[dict | None]
-```
-
-运行时行为：直接返回传入的 `value`（`type_` 参数仅用于类型推断）。
+`ConfigItemProxy` 由 `ConfigDeclareMixin` 自动生成，不要手动实例化。
 
 ### ConfigInMainProcessPipe
 
-主进程管道接口，每个子进程对应创建一个实例。
+主进程侧的管道口，每个子进程创建一个。
 
-```python
-ConfigInMainProcessPipe(config)      # config: 主进程里的配置单例
-```
+| 成员 | 说明 |
+|---|---|
+| `child_id` | 分配给这个子进程的 ID（`"child-1"`、`"child-2"`……） |
+| `get_queues()` | 返回 `(set_queue, get_queue)`，传给子进程 |
+| `close()` | 停止监听线程并注销队列 |
 
-| 方法 | 说明 |
-|------|------|
-| `get_queues()` | 返回 `(set_queue, get_queue)` 元组，传递给子进程 |
-| `close()` | 关闭管道，停止监听线程 |
+它把队列注册进 `config.queues`，于是主进程每次 `set` 都会自动广播。收到子进程消息后直接调 `config.set` / `config.reset`，通知由配置对象自己发，这里不再另发。
 
-它把队列注册进 `config.queues`（于是主进程的每次 `set` 都会自动广播），
-并起一个线程收子进程的消息；收到后直接调 `config.set` / `config.reset`，
-**不另外发通知**（否则就是双发）。
+`child_id` 不用额外传参：子进程构造时会用 `GETALL` 向主进程要一份初始配置，主进程在同一条回复里把 ID 一起给它。所以 `get_queues()` 和构造签名都没变。
 
 ### ConfigInChildProcessPipe
-
-子进程侧的配置实例，通过队列与主进程通信。与 `Config` 是**同一套接口**
-（点操作、`on` / `off` / `value_changed` / `off_value_changed` 都在），继承 `ConfigDeclareMixin`，
-配一份声明就有 `cfg.xxx.get()`。
 
 ```python
 ConfigInChildProcessPipe(config_set_queue, config_get_queue)
 ```
 
 | 方法 | 说明 |
-|------|------|
-| `get(key)` | 从本地缓存读取；**缺键抛 `KeyError`** |
-| `get("all")` | 返回**本地整份配置的副本**（与 `ConfigMemory` 一致；缓存里就是主进程广播过来的那一整份，所以不必走队列）。它是"最近一次广播"的快照 —— 自己刚 `set` 的值一定在，别的进程刚写的可能还没到 |
-| `set(key, value)` | 修改配置（**乐观**：先改本地缓存，消息发给主进程落盘+广播） |
-| `reset(key)` | 恢复默认值（**悲观/异步**：只发消息，本地缓存要等广播回来才变） |
-| `on` / `off` / `value_changed` / `off_value_changed` | 订阅，跨进程的变更由 diff 自动派发到这里 |
-| `close()` | 关闭管道，停止同步线程 |
+|---|---|
+| `child_id` | 主进程分配的 ID，构造时领到；发消息时带上，用于识别回声 |
+| `get(key)` | 读本地缓存，缺键抛 `KeyError` |
+| `get("all")` | 本地整份配置的副本，是最近一次广播的快照 |
+| `set(key, value)` | 乐观写，先改本地缓存再发消息 |
+| `reset(key)` | 悲观重置，只发消息，本地缓存等广播回来才变；通知也在那时才发（见「订阅与通知」） |
+| `on` / `off` / `value_changed` / `off_value_changed` | 订阅，跨进程变更自动派发到这里 |
+| `close()` | 停止同步线程 |
 
-**启动**：构造时会向主进程要一份完整配置并等它回来，
-等 `INIT_TIMEOUT = 30` 秒还没到就抛 `RuntimeError` —— 说明主进程的
-`ConfigInMainProcessPipe` 还没起来，或者管道对象传错了。
-
-> `reset` 的异步性是**设计**，不是 bug：跨进程的写一律经主进程统一处理。
-> 代价是 `reset` 返回时读到的可能还是旧值，广播到达时会按 diff 派发正确的新值。
-
-### diff_changes(before, after)
-
-`[(key, value), ...]`，逐键 diff。用它才能回答"整份配置广播下来，到底哪些键变了"。
+`get("all")` 是快照而不是实时值：自己刚 `set` 的一定在，别的进程刚写的可能还没到。要严格最新就回主进程读。
 
 ## 注意事项
 
-1. **多进程环境下请保持 `Config` 单例** — 多个 `Config` 实例同时操作同一文件会导致数据不一致
-2. **子进程的 `ConfigInChildProcessPipe` 不直接写文件** — 所有写操作会发送请求，由主进程统一处理
-3. **多进程场景推荐使用共享声明类模式** — 把配置声明抽到 `AppKeys`，主进程与子进程各自继承，避免两边维护两份键名
-4. **单进程场景直接继承 `Config` + 声明类** — 无需为多进程专门拆类
-5. **使用完毕后调用 `close()`** — 主进程的 `ConfigInMainProcessPipe` 与子进程的 `ConfigInChildProcessPipe` 都要调，避免守护线程未正常退出
-6. **文件名不含 `.json` 后缀** — 传入 `"myconfig"` 对应 `myconfig.json`
-7. **父目录必须先存在** — `Config` 只负责写 `"<file_name>.json"`，**不建目录**。`"config_files/app"` 这种带层级的路径要先自己 `os.makedirs`（`xiaoe_ui` 的 `app_config_dir()` 会代劳），否则补默认值 / `set()` 落盘时抛 `FileNotFoundError`
-8. **子进程的 `get('all')` 是"最近一次广播"的快照** — 不是实时：自己刚 `set` 的在、别的进程刚写的可能还没到。要严格最新就回主进程读；枚举键（`keys.orphans()`）用它没问题
-9. **老名字不要拿去覆写** — 子类实现 `get` / `set` / `reset`；`configget` / `configset` / `configreset` 是接口层的转发壳
-10. **`get('all')` 有重读文件并替换内存副本的副作用** — 要读单键就用 `get(key)`
-11. **延迟落盘有窗口** — `set` 返回时值只在内存里；要保证某次改动已经进文件，就 `cfg.flush()`。进程被 `SIGKILL` / `os._exit()` 干掉时 `atexit` 不跑，窗口内的改动会丢
+**进程模型**
+
+- 同一个配置文件必须对应一个 `Config` 单例，多个实例同时写同一个文件会互相覆盖
+- 每个子进程要独立的一对队列
+- 主进程和子进程两侧的管道对象用完都要 `close()`
+- 文件名不带 `.json`，父目录要先自己建
+
+**落盘与读取**
+
+- `set` 返回时值只在内存里，要保证已经进文件就调 `flush()`。强杀进程时 `atexit` 不跑，窗口内的改动会丢
+- 程序运行期间手改配置文件不生效，记住这一条能省很多排查时间
+- 子进程的 `get('all')` 是最近一次广播的快照，要实时值就回主进程读
+- 子进程 `reset()` 返回时通知还没发，别在它后面立刻断言回调已经跑过
+
+**键名**
+
+- 声明键名别用方法名和框架内部属性名，撞了会在类创建时抛 `TypeError`
+- 没声明的键走 `cfg.item("键名")`，`all` 除外
+
 ## 许可证
 
 MIT

@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: xiaoe-config-manager
-Version: 2.2.0
+Version: 2.2.1
 Summary: 多进程安全的 JSON 配置文件管理器，支持默认配置、动态重置与进程间自动同步
 License-Expression: MIT
 Project-URL: Homepage, https://github.com/xiaoe/xiaoe-config-manager

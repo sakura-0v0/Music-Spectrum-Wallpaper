@@ -14,8 +14,11 @@
 
 1. 键只认 :class:`ConfigKeysBase` 的子类（以及实现类自己的类体）；
    后端类（``Config`` / ``ConfigMemory`` / 管道）的类字典一律不扫。
-2. 默认值必须是 :data:`DATA_TYPES` 里的数据 —— 函数、property、``QMetaObject``
-   之类不是配置项。
+2. 默认值必须是 ``str`` / ``int`` / ``float`` / ``bool`` / ``list`` / ``dict`` /
+   ``None`` 之一（见 :data:`~xiaoe_config_manager.config_types.DATA_TYPES`）。
+   其它东西一律在类创建时 :class:`TypeError` —— 判据是"是不是配置值"，
+   不是"猜猜作者想干嘛"。类体里的方法、嵌套类、模块，以及下划线开头的名字，
+   属于"本来就不是配置项"，直接跳过，不算违规。
 3. 键名不许撞 :data:`RESERVED_KEYS`，也不许撞实现类上已有的任何属性
    （动态判定）—— 命中直接 :class:`TypeError`，不静默。
 4. 一条继承链上不准出现同名键（``class Child(AppKeys)`` 里再写一遍 ``app_name``）；
@@ -39,10 +42,12 @@
 
 from __future__ import annotations
 
+import types
 from typing import Any, Callable, Generic, TypeVar, overload
 
+from xiaoe_config_manager.config_types import DATA_TYPES, ConfigValue
+
 __all__ = [
-    "DATA_TYPES",
     "RESERVED_KEYS",
     "ConfigKeysBase",
     "ConfigDeclareMixin",
@@ -52,12 +57,7 @@ __all__ = [
 ]
 
 T = TypeVar("T")
-
-#: 允许当默认值的类型。默认值最终要进 JSON（或内存 dict）、要能跨进程 pickle，
-#: 所以只认这些。故意不含 ``set``：它过得了这里的校验，却会让 ``json.dump``
-#: 在文件被截断之后失败 —— 那是「配置全丢」的起点（见 README 的故障链一节）。
-#: ``tuple`` 保留，但写进 JSON 会退化成 ``list``（读回来是 list）。
-DATA_TYPES = (str, int, float, bool, list, dict, tuple, type(None))
+T2 = TypeVar("T2")
 
 #: 不许当配置键的名字。
 #:
@@ -81,6 +81,7 @@ RESERVED_KEYS = frozenset({
     # 子进程管道自己的实例属性
     "config_set_queue",
     "config_get_queue",
+    "child_id",
     # 订阅接口名（manager 侧是方法，桥侧是 Qt 信号）
     "value_changed",
     # get / set / reset 把它当特殊键名：get('all') 读整份、reset('all') 重置整份、
@@ -95,7 +96,7 @@ def default(value: T) -> "ConfigItemProxy[T]": ...
 
 
 @overload
-def default(value: None, type_: Any) -> "ConfigItemProxy[Any]": ...
+def default(value: None, type_: type[T2]) -> "ConfigItemProxy[T2 | None]": ...
 
 
 def default(value: Any = None, type_: Any = None) -> Any:
@@ -125,14 +126,58 @@ def default(value: Any = None, type_: Any = None) -> Any:
 # 扫描
 # ══════════════════════════════════════════════════════════════
 
+def _is_not_a_config_item(value: Any) -> bool:
+    """判断类体里某个属性是不是"本来就不是配置项"的东西。
+
+    这一类不需要报错，直接跳过：
+
+    * 方法 / 函数（``def helper(self)``、``staticmethod``、``classmethod``）；
+    * 嵌套类（``class Inner``）；
+    * 模块（``import os`` 那种）；
+    * 描述符（``property`` 已在调用处单独处理）。
+
+    除此之外、又不是 :data:`DATA_TYPES` 的东西，就是作者真的写错了一个默认值，
+    该报错（见 :func:`_check_value_type`）。
+    """
+    return (
+        callable(value)
+        or isinstance(value, (type, types.ModuleType))
+    )
+
+
+def _check_value_type(cls: type, attr: str, value: Any) -> None:
+    """默认值不在 :data:`DATA_TYPES` 里就报错。
+
+    Args:
+        cls: 声明所在类（只用来拼报错信息）。
+        attr: 属性名。
+        value: 被声明的值。
+
+    Raises:
+        TypeError: 值的类型不是配置值。
+    """
+    raise TypeError(
+        f"{cls.__name__}.{attr} 不能当配置项的默认值："
+        f"它是 {type(value).__name__}，而默认值必须是 "
+        f"str / int / float / bool / list / dict / None 之一。"
+        f"（不想让它当配置项的话，名字以下划线开头即可。）"
+    )
+
+
 def _declared_in(cls: type) -> dict:
     """扫出 ``cls`` 自己类体里声明的键（不含继承来的）。
+
+    类体里"本来就不是配置项"的东西（方法、嵌套类、模块）跳过；
+    其余不是配置值的一律 :class:`TypeError`，不静默忽略。
 
     Args:
         cls: 要扫描的类。
 
     Returns:
         ``{键名: 默认值}``。
+
+    Raises:
+        TypeError: 某个属性既不是配置值，也不是方法/嵌套类/模块。
     """
     out: dict = {}
     for attr, value in list(vars(cls).items()):
@@ -140,8 +185,10 @@ def _declared_in(cls: type) -> dict:
             continue
         if isinstance(value, (property, staticmethod, classmethod)):
             continue
-        if not isinstance(value, DATA_TYPES):
+        if _is_not_a_config_item(value):
             continue
+        if not isinstance(value, DATA_TYPES):
+            _check_value_type(cls, attr, value)
         out[attr] = value
     return out
 
@@ -181,6 +228,23 @@ def _check_inheritance_conflict(cls: type, own: dict) -> None:
 def _check_reserved(cls: type, keys: dict) -> None:
     """拦「键名砸掉框架自己的属性」：先查显式清单，再动态查实现类。
 
+    动态部分的判据是「这个名字在 MRO 上有没有被赋过值」，但要跳过**纯声明类** ——
+    那些类的类体里本来就只有 ``键 = 默认值``，是配置数据的来源，不算"撞"。
+
+    跳过条件必须收窄到「纯声明」：``ConfigDeclareMixin`` 及其子类（``ConfigBase`` /
+    ``Config`` / ``ConfigMemory`` / 两个管道类）是**实现类**，它们的类字典里是真正的
+    方法和属性，必须查。
+
+    以前这里只判 ``issubclass(base, ConfigKeysBase)``，而实现类全是它的子类，
+    于是一路 ``continue`` 过去，``broadcast`` / ``broadcast_all`` / ``flush`` /
+    ``path`` / ``update_config`` / ``configupdate_config`` 都能被声明成键。
+    后果分三种：``set`` 里 ``self.broadcast(...)`` 抛 ``'ConfigItemProxy' object is
+    not callable``、构造期抛 ``expected str, bytes or os.PathLike``、或者
+    ``update_config()`` 静默变成读一个代理什么都不做。
+
+    只有 ``get`` / ``set`` / ``reset`` 那一批当时被拦住了 —— 因为它们在 ``ConfigApi``
+    上，而 ``ConfigApi`` 不继承 ``ConfigKeysBase``，歪打正着进了检查范围。
+
     Args:
         cls: 要检查的类。
         keys: 待检查的 ``{键名: 默认值}``。
@@ -196,8 +260,12 @@ def _check_reserved(cls: type, keys: dict) -> None:
         for base in cls.__mro__[1:]:
             if base is object:
                 continue
-            if isinstance(base, type) and issubclass(base, ConfigKeysBase):
-                continue                     # 声明类自己的键，不算撞
+            if (
+                isinstance(base, type)
+                and issubclass(base, ConfigKeysBase)
+                and not issubclass(base, ConfigDeclareMixin)
+            ):
+                continue                     # 纯声明类自己的键，不算撞
             if name in vars(base):
                 bad.add(name)
                 break
@@ -255,8 +323,10 @@ def collect_defaults(cls: type) -> dict:
                 continue
             if isinstance(value, (property, staticmethod, classmethod)):
                 continue
-            if not isinstance(value, DATA_TYPES):
+            if _is_not_a_config_item(value):
                 continue
+            if not isinstance(value, DATA_TYPES):
+                _check_value_type(cls, attr, value)
             out[attr] = value
 
     _check_reserved(cls, out)
