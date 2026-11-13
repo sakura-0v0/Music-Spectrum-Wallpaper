@@ -45,6 +45,7 @@ from __future__ import annotations
 import types
 from typing import Any, Callable, Generic, TypeVar, overload
 
+from xiaoe_config_manager.config_field import ConfigField
 from xiaoe_config_manager.config_types import DATA_TYPES, ConfigValue
 
 __all__ = [
@@ -65,6 +66,9 @@ T2 = TypeVar("T2")
 #: （类字典里没有它们），以及几个语义特殊的名字。方法是动态判定的，不用抄进来。
 RESERVED_KEYS = frozenset({
     "DEFAULTS",
+    #: 额外属性表，与 ``DEFAULTS`` 同形状（``{键名: ConfigField}``）。
+    #: 它不是配置数据、永远不落盘，所以不许被声明成配置键。
+    "FIELDS",
     # 声明层 / 代理层自己的
     "item",
     "keys",
@@ -126,6 +130,15 @@ def default(value: Any = None, type_: Any = None) -> Any:
 # 扫描
 # ══════════════════════════════════════════════════════════════
 
+#: 类体里这两个名字不是配置键，扫描时直接跳过。
+#:
+#: 它们都是「框架自己算出来的表」，与 ``键 = 默认值`` 是并列关系，不是数据。
+#: 与 :data:`RESERVED_KEYS` 的区别：在**这里**意味着"扫的时候当没看见"，
+#: 在保留字里意味着"作者不许这么写"。两处都要有 —— 少了这里会把它当配置键
+#: 扫进去（进而落盘），少了那里则允许作者自己声明一个同名的键。
+_NOT_A_KEY = frozenset({"DEFAULTS", "FIELDS"})
+
+
 def _is_not_a_config_item(value: Any) -> bool:
     """判断类体里某个属性是不是"本来就不是配置项"的东西。
 
@@ -170,6 +183,9 @@ def _declared_in(cls: type) -> dict:
     类体里"本来就不是配置项"的东西（方法、嵌套类、模块）跳过；
     其余不是配置值的一律 :class:`TypeError`，不静默忽略。
 
+    带额外属性声明的键（``height = NumberField(...)``）在这里被拆成两部分：
+    默认值进返回值，Field 对象进 ``cls._own_fields``。
+
     Args:
         cls: 要扫描的类。
 
@@ -180,17 +196,39 @@ def _declared_in(cls: type) -> dict:
         TypeError: 某个属性既不是配置值，也不是方法/嵌套类/模块。
     """
     out: dict = {}
-    for attr, value in list(vars(cls).items()):
-        if attr.startswith("_") or attr == "DEFAULTS":
+    fields: dict = {}
+    _scan_into(cls, cls, out, fields)
+    cls._own_fields = fields
+    return out
+
+
+def _scan_into(cls: type, base: type, out: dict, fields: dict) -> None:
+    """把 ``base`` 类体里声明的键扫进 ``out`` / ``fields``。
+
+    这是**唯一**一处「什么样的类体属性算配置项」的判定，声明扫描和继承
+    合并都走它，免得两处规则漂移。
+
+    Args:
+        cls: 报错时拼信息用的类（通常是真正在创建的类）。
+        base: 真正被扫的类体。
+        out: 收集 ``{键名: 默认值}``，就地更新。
+        fields: 收集 ``{键名: ConfigField}``，就地更新。
+    """
+    for attr, value in list(vars(base).items()):
+        if attr.startswith("_") or attr in _NOT_A_KEY:
             continue
         if isinstance(value, (property, staticmethod, classmethod)):
             continue
         if _is_not_a_config_item(value):
             continue
+        if isinstance(value, ConfigField):
+            # Field 代替 default：默认值照收，Field 单独存
+            fields[attr] = value
+            out[attr] = value.default
+            continue
         if not isinstance(value, DATA_TYPES):
             _check_value_type(cls, attr, value)
         out[attr] = value
-    return out
 
 
 def _check_inheritance_conflict(cls: type, own: dict) -> None:
@@ -301,13 +339,16 @@ def collect_defaults(cls: type) -> dict:
         TypeError: 声明了保留字，或继承链上出现同名键。
     """
     out: dict = {}
+    fields: dict = {}
 
-    # ① 继承来的 DEFAULTS
+    # ① 继承来的 DEFAULTS / FIELDS
     for base in cls.__mro__[1:]:
         if base is object:
             continue
         for key, value in (base.__dict__.get("DEFAULTS") or {}).items():
             out.setdefault(key, value)
+        for key, value in (base.__dict__.get("FIELDS") or {}).items():
+            fields.setdefault(key, value)
 
     # ② + ③ 扫声明来源
     for base in reversed(cls.__mro__):
@@ -318,18 +359,13 @@ def collect_defaults(cls: type) -> dict:
                 continue
             if issubclass(base, ConfigDeclareMixin):
                 continue                     # 实现类的类字典不扫
-        for attr, value in list(vars(base).items()):
-            if attr.startswith("_") or attr == "DEFAULTS":
-                continue
-            if isinstance(value, (property, staticmethod, classmethod)):
-                continue
-            if _is_not_a_config_item(value):
-                continue
-            if not isinstance(value, DATA_TYPES):
-                _check_value_type(cls, attr, value)
-            out[attr] = value
+        _scan_into(cls, base, out, fields)
 
     _check_reserved(cls, out)
+    # 无条件赋值，与 DEFAULTS 同款：作者在类体里写了个 `FIELDS = ...` 的话，
+    # 会被这里覆盖掉，而不是留着一个坏值让 proxy.field 在后面炸。
+    # 继承来的已经在上面合并进 fields 了，所以清零不会丢东西。
+    cls.FIELDS = fields
     return out
 
 
@@ -356,8 +392,18 @@ class ConfigKeysBase:
     #: 本类认得的键与默认值（由 ``__init_subclass__`` 算好）
     DEFAULTS: dict = {}
 
+    #: 本类认得的键的**额外属性**，与 :attr:`DEFAULTS` 同形状
+    #: （``{键名: ConfigField}``）。只有用 :mod:`config_field` 里的类声明过
+    #: 才会出现；老写法（``default(...)``）不产生这张表。
+    #:
+    #: 它**不进** ``DEFAULTS``、不落盘、不参与广播 —— 纯元数据。
+    FIELDS: dict = {}
+
     #: 本类自己类体里声明的键（不含继承来的）—— 重名检查要用
     _own_declared: dict = {}
+
+    #: 本类自己类体里声明的额外属性（不含继承来的）—— 继承合并要用
+    _own_fields: dict = {}
 
     def __init_subclass__(cls, **kwargs):
         """子类创建时算出 ``DEFAULTS``（顺带做重名与保留字检查）。
@@ -480,6 +526,41 @@ class ConfigItemProxy(Generic[T]):
     def key(self) -> str:
         """配置键名（``"speed"`` 这种字符串）。"""
         return self._key
+
+    @property
+    def owner(self) -> Any:
+        """这个配置项所属的配置对象。
+
+        有了它，一个代理就**自足**了 —— 接受配置项的接口不需要再单独收一个
+        ``config=`` 参数::
+
+            def save(item):            # 只要一个句柄
+                item.owner.set(item.key, 1)
+
+            save(cfg.speed)
+        """
+        return self._owner
+
+    @property
+    def field(self) -> ConfigField | None:
+        """这个配置项的额外属性，没声明就是 ``None``。
+
+        查的是 owner 的类上那张 :attr:`ConfigKeysBase.FIELDS` 表 ——
+        Field 只存在那里一份，代理不复制、也不缓存。
+
+        返回 ``None`` 的两种情况，调用方都要当成"没声明"处理：
+
+        * 这个键是用老写法 ``default(...)`` 声明的；
+        * 这是一份非声明式配置（``Config(path, default_config=...)``），
+          它的类上根本没有 ``FIELDS``。
+
+        用 ``getattr`` 而不是直接取属性，就是为了第二种情况不抛
+        ``AttributeError`` —— 那不是错误，只是没有额外属性而已。
+
+        Returns:
+            :class:`~xiaoe_config_manager.config_field.ConfigField` 实例或 ``None``。
+        """
+        return (getattr(self._owner, "FIELDS", None) or {}).get(self._key)
 
     def __repr__(self) -> str:
         return f"<ConfigItemProxy {self._key!r}>"

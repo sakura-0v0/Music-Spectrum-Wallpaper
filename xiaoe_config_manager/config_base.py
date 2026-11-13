@@ -25,6 +25,7 @@ import copy
 import sys
 import threading
 import traceback
+from dataclasses import replace
 from typing import Callable, Literal, overload
 
 from xiaoe_config_manager.config_api import ConfigApi
@@ -421,6 +422,10 @@ class ConfigBase(ConfigDeclareMixin, ConfigApi):
         这种"照本类的声明再造一份内存版"的用法 —— 它内部就是按 ``cls.DEFAULTS``
         合成一个临时声明类，所以点操作、订阅、``get('all')`` 一样都不少。
 
+        声明了额外属性（``FIELDS``）的类也照搬：合成类里放的是**带新默认值的
+        Field 副本**，所以 ``AppCfg.memory({"height": 999})`` 之后
+        ``cfg.height.field`` 仍然拿得到范围/步进，只是 ``default`` 变成 999。
+
         Args:
             defaults: 额外默认值，盖在同名声明值上面 —— 最终默认值是
                 ``{**cls.DEFAULTS, **defaults}``，同时也是 reset 的目标。
@@ -436,8 +441,17 @@ class ConfigBase(ConfigDeclareMixin, ConfigApi):
             # 没有声明键 → 不用合成类，直接给内存后端
             return ConfigMemory(data)
 
-        # 有声明键：把键合成一个临时声明类挂上去，这样 cfg.键名 的点操作也在
-        keys_cls = type(f"_{cls.__name__}MemoryKeys", (ConfigKeysBase,), dict(data))
+        # 有声明键：把键合成一个临时声明类挂上去，这样 cfg.键名 的点操作也在。
+        # 声明了额外属性的键，那个位置放 Field 而不是裸值 —— 扫描器会把
+        # default 摘出来放进 DEFAULTS、把 Field 收进 FIELDS，两边都对。
+        # 最终默认值可能被 defaults 覆盖了，所以 Field 换一份带新 default 的副本，
+        # 其余槽位（range / step / options ...）原样保留。
+        fields = getattr(cls, "FIELDS", None) or {}
+        attrs: dict = {}
+        for key, value in data.items():
+            field = fields.get(key)
+            attrs[key] = value if field is None else replace(field, default=value)
+        keys_cls = type(f"_{cls.__name__}MemoryKeys", (ConfigKeysBase,), attrs)
         memory_cls = type(f"{cls.__name__}Memory", (ConfigMemory, keys_cls), {})
         return memory_cls(data)
 

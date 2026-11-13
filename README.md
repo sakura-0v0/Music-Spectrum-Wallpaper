@@ -14,13 +14,15 @@
 
 ```python
 from xiaoe_config_manager import (
-    Config, ConfigMemory, ConfigInChildProcessPipe, ConfigKeysBase, default,
+    Config, ConfigMemory, ConfigInChildProcessPipe, ConfigKeysBase,
+    IntField, TextField, default,
 )
 
 class AppKeys(ConfigKeysBase):
     """共用的Key类"""
-    app_name = default("myapp")
-    timeout  = default(30)
+    app_name = TextField(default="myapp")
+    timeout  = IntField(default=30, range=(0, 600), step=1)
+    remark   = default("")          # 老写法：只记默认值和类型，一样能用
 
 class AppConfig(Config, AppKeys): ... # 组合
 class AppMemory(ConfigMemory, AppKeys): ...  # 组合
@@ -56,13 +58,12 @@ pip install xiaoe-config-manager
 声明Keys类，与Config类组合并实例化：
 
 ```python
-from xiaoe_config_manager import Config, ConfigKeysBase, default
+from xiaoe_config_manager import Config, ConfigField, ConfigKeysBase, IntField, TextField
 
 class AppKeys(ConfigKeysBase):
-    app_name = default("myapp")
-    timeout  = default(30)
-    debug    = default(False)
-    id_list  = default(None, list)
+    app_name = TextField(default="myapp")
+    timeout  = IntField(default=30, range=(0, 600), step=1, unit="秒")
+    debug    = ConfigField(default=False)
 
 class AppConfig(Config, AppKeys):
     ...
@@ -75,6 +76,56 @@ cfg.timeout.get()       # 60
 cfg.timeout.reset()     # 恢复默认
 cfg.flush()             # 立刻落盘，不等定时器
 ```
+
+字段类就是「这个配置项长什么样」的声明处：值的类型、范围、步进、单位、选项都写在
+这里一次。界面层直接读这些声明，不必在每个调用点再抄一遍。
+
+**范围、选项、单位这些都只是存储，不做校验。** `range=(0, 1080)` 不会在 `set(9999)`
+时抛错 —— 它是给控件（滑块上限、输入框步进）和命令行（打印 `500 px`）读的定义域，
+拦不拦由调用方决定。这个包负责的是「值怎么存、怎么写进 JSON、怎么通知」。
+
+| 字段类 | 值类型 | 必填 / 常用参数 |
+|---|---|---|
+| `ConfigField` | 由 `default` 决定 | `default` |
+| `TextField` | `str \| None` | `default` |
+| `IntField` | `int \| None` | `range`、`step`，可选 `unit` |
+| `FloatField` | `float \| None` | `range`、`step`，可选 `unit` |
+| `ChoiceField` | 由 `options` 决定 | `options`，可选 `store_index` |
+| `ColorField` | `list[int] \| None` | `default`，可选 `rgba` |
+| `PathField` | `str \| None` | `default`，可选 `mode` / `file_filter` / `start_dir` / `check_exists` |
+| `ImageField` | `str \| None` | `default`，可选 `file_filter` / `start_dir` |
+| `DateField` | `str \| None` | `default`，可选 `fmt` |
+| `DictField` | `dict \| None` | `fields`（键固定，逐个声明类型） |
+| `ListField` | `list[T] \| None` | `default`，可选 `item` |
+| `GradientField` | `list[dict] \| None` | 色标列表，每项 `{"pos": float, "color": [r,g,b,a]}` |
+
+所有字段都支持 `title` / `desc` 两个描述性 slot。
+
+```python
+class AppKeys(ConfigKeysBase):
+    # 范围、步进、单位都写在声明处
+    height = IntField(default=500, range=(0, 1080), step=1, unit="px")
+
+    # 小数：range 也要写成小数，否则滑块会停在整数之间（会当场抛 ValueError）
+    opacity = FloatField(default=0.85, range=(0.0, 1.0), step=0.05)
+
+    # 从固定选项里挑一个；store_index=True 时存索引而不是原始值
+    theme = ChoiceField(default="暗", options=("亮", "暗"), store_index=True)
+
+    # 固定几个键的字典
+    window = DictField(fields={
+        "x": IntField(default=0, range=(-5000, 5000), step=1),
+        "y": IntField(default=0, range=(-5000, 5000), step=1),
+    })
+
+    # 列表：元素类型由 item 决定
+    paths = ListField(
+        default=[{"path": ""}],
+        item=DictField(fields={"path": PathField(default="")}),
+    )
+```
+
+> 老写法 `default(...)` 也还在，见 [旧写法 `default()`](#旧写法-default)。新代码建议用字段类。
 
 ### 点键访问和直接调用
 
@@ -93,16 +144,20 @@ cfg.flush()             # 立刻落盘，不等定时器
 ### 命名与扫描规则
 
 1. 只收集 `ConfigKeysBase` 的子类，以及实现类自己的类体。
-2. 默认值必须是 `str`、`int`、`float`、`bool`、`list`、`dict`、`None` 之一，其它一律在类创建时抛 `TypeError`。判据是「它能不能当一个配置值」，不是猜作者想干嘛。类体里的方法、嵌套类、模块，以及下划线开头的名字，属于本来就不是配置项的东西，直接跳过，不算违规。
-3. 键名撞了保留字会当场抛 `TypeError`，不会静默跳过。检查分两层：先看固定清单（`config`、`fname`、`queues`、`default_config`、`item`、`memory`、`DEFAULTS`、`all` 等），再动态查实现类 MRO 上已有的属性名，所以 `get`、`set`、`on` 这些方法名同样不能当键名。`all` 尤其特殊：它是 `get('all')` 和 `reset('all')` 专用的键名。
+2. 类体里的**字段对象**（`ConfigField` 及其子类）会被收进 `FIELDS`，它的 `default`
+   进 `DEFAULTS`。除此之外的裸值也接受，但必须是 `str`、`int`、`float`、`bool`、
+   `list`、`dict`、`None` 之一，其它一律在类创建时抛 `TypeError`。判据是「它能不能
+   当一个配置值」，不是猜作者想干嘛。类体里的方法、嵌套类、模块，以及下划线开头的
+   名字，属于本来就不是配置项的东西，直接跳过，不算违规。
+3. 键名撞了保留字会当场抛 `TypeError`，不会静默跳过。检查分两层：先看固定清单（`config`、`fname`、`queues`、`default_config`、`item`、`memory`、`DEFAULTS`、`FIELDS`、`all` 等），再动态查实现类 MRO 上已有的属性名，所以 `get`、`set`、`on` 这些方法名同样不能当键名。`all` 尤其特殊：它是 `get('all')` 和 `reset('all')` 专用的键名。
 4. 一条继承链上重复声明同一个键会抛 `TypeError`。兄弟基类同名不拦，按 MRO 走，优先取左。
 
 ```python
 class ParentKeys(ConfigKeysBase):
-    app_name = default("p")
+    app_name = TextField(default="p")
 
 class ChildKeys(ParentKeys):
-    app_name = default("c")      # TypeError：继承链上已经有这个键
+    app_name = TextField(default="c")   # TypeError：继承链上已经有这个键
 
 class Broken(ConfigKeysBase):
     pair = (1, 2)                # TypeError：tuple 不是配置值
@@ -112,34 +167,120 @@ class Broken(ConfigKeysBase):
 
 > `tuple` 不在允许清单里。它写进 JSON 会退化成 `list`，读回来类型就变了，不如在声明时就拦下。
 
+## 旧写法 `default()`
+
+`default()` 仍然可用，它只做两件事：记下默认值、给类型检查器一个提示。它不带任何
+「这个配置项长什么样」的信息（范围、选项、单位都得在用到的地方另写）。
+
+```python
+from xiaoe_config_manager import default
+
+class AppKeys(ConfigKeysBase):
+    app_name = default("myapp")       # 等价于 TextField(default="myapp")
+    timeout  = default(30)            # 类型是 int，但没有范围
+    id_list  = default(None, list)    # 可空，第二个参数给类型
+```
+
+它和字段类可以混用，扫描规则一致。**什么时候还值得用**：值就是一个裸的
+`str` / `int` / `list` / `dict`，确实不需要范围、选项、单位这些额外属性 —— 这时
+`default(30)` 比 `ConfigField(default=30)` 短一点。
+
+需要注意它的类型推断有限：`default(None, list)` 只知道「是个 list」，元素类型要在
+用到的地方自己标；而 `ListField(item=DictField(...))` 连元素的形状都写清了。
+
 ## 类型注解
 
-`default()` 会推断类型，让 IDE 和类型检查器认得 `.get()` 的返回值和 `.set()` 的参数：
+字段类的值类型直接来自类的定义，IDE 和类型检查器不用推断：
 
 ```python
 class AppKeys(ConfigKeysBase):
-    timeout  = default(30)          # ConfigItemProxy[int]
-    app_name = default("myapp")     # ConfigItemProxy[str]
-    id_list  = default(None, list)  # ConfigItemProxy[list | None]
+    timeout  = IntField(default=30, range=(0, 600), step=1)   # int | None
+    app_name = TextField(default="myapp")                     # str | None
+    ports    = ListField(default=[], item=IntField(default=80, range=(1, 65535), step=1))
 
-n: int = cfg.timeout.get()          # 通过
+n: int = cfg.timeout.get()          # 通过（可能需要先判空，见下）
 cfg.timeout.set(60)                 # 通过
 cfg.timeout.set("oops")             # 类型检查报错
 ```
 
-`default(None, type)` 表示可空，第二个参数提供类型。元素类型也要精确时可以写注解：
+**每个字段的值类型都带 `| None`。** 配置值是从 JSON 读出来的，下面三种情况都会是
+`None`，而且都合法：`default=None`（没设）、用户手改 `app.json` 删了那个键、旧版本
+配置里还没有这个键。所以 `cfg.path.get()` 的静态类型是 `str | None`，用之前要判空。
+
+想让类型更紧，就用基类自己标：
 
 ```python
-from typing import Optional
+from xiaoe_config_manager import ConfigField
 
 class AppKeys(ConfigKeysBase):
-    ports: ConfigItemProxy[list[int]]           = default(None, list)
-    tags:  ConfigItemProxy[Optional[list[str]]] = default(None, list)
+    name = ConfigField[str](default="")     # -> str（default 必须真的不是 None）
 ```
 
-也可以只写裸值（`timeout = 30`），运行时行为完全一样，但点键访问就没有静态检查了。
+`DictField` / `ListField` 的**元素**类型由它们自己的声明描述（`fields` / `item`），
+不需要额外注解。
 
-建议始终用 `default()`。
+> 只写裸值（`timeout = 30`）运行时行为完全一样，但点键访问就没有静态检查了。
+
+## 运行时读字段声明
+
+控件、CLI、导出工具常常需要「这个键长什么样」，而不是「值是多少」。声明不应该被
+抄到第二个地方，所以字段对象本身可以从两个入口取到：
+
+```python
+class AppKeys(ConfigKeysBase):
+    height = IntField(default=500, range=(0, 1080), step=1, unit="px", title="高度")
+
+# ① 类上：整张表
+AppKeys.FIELDS["height"].range      # (0, 1080)
+AppKeys.FIELDS["height"].unit       # "px"
+AppKeys.DEFAULTS["height"]          # 500
+
+# ② 实例上：从键句柄拿
+cfg.height.field.range              # (0, 1080)
+cfg.height.field.title              # "高度"
+cfg.height.key                      # "height"
+```
+
+`FIELDS` 存的是**字段对象本身**，`DEFAULTS` 存的是**解析出来的默认值**（纯 JSON
+值）。两者都由扫描类体得到，不用手写第二份。
+
+用 `default()` 老写法声明的键，`FIELDS` 里也会有一项（是一个只带 `default` 的
+`ConfigField`），所以读字段声明的代码不必区分新旧写法：
+
+```python
+AppKeys.FIELDS["app_name"].title    # ""（default() 没给 title）
+```
+
+`collect_defaults(cls)` 是取 `DEFAULTS` 的函数形式，给「只要一份默认值字典」的
+场景用（比如建内存版配置）：
+
+```python
+from xiaoe_config_manager import collect_defaults
+
+defaults = collect_defaults(AppKeys)     # {"height": 500, ...}
+```
+
+## 值的类型：`ConfigValue` 与 `DATA_TYPES`
+
+一个配置值能是什么，写死在 `ConfigValue` 里：
+
+```python
+ConfigValue = str | int | float | bool | None | list[ConfigValue] | dict[str, ConfigValue]
+```
+
+`DATA_TYPES` 是它的运行时版（给 `isinstance` 用），由 `ConfigValue` 推导，不是
+另抄一份：
+
+```python
+from xiaoe_config_manager import DATA_TYPES
+
+DATA_TYPES      # (str, int, float, bool, NoneType, list, dict)
+isinstance(v, DATA_TYPES)
+```
+
+**没有 `tuple`。** 它写进 JSON 会退化成 `list`，读回来的类型就变了 —— 所以声明处
+写 tuple 会在类创建时被拦下。要表达「一组值」用 `list`；要表达「固定几个分量」
+（比如颜色）用 `ColorField`，它的值类型就是 `list[int]`。
 
 ## 订阅与通知
 
@@ -219,14 +360,14 @@ import threading
 
 from xiaoe_config_manager import (
     Config, ConfigInMainProcessPipe, ConfigInChildProcessPipe,
-    ConfigKeysBase, default,
+    ConfigKeysBase, IntField, TextField,
 )
 
 class AppKeys(ConfigKeysBase):
     """主进程和子进程共用同一份声明。"""
-    workers       = default(4)
-    worker_status = default(None, str)
-    master_status = default(None, str)
+    workers       = IntField(default=4, range=(1, 64), step=1)
+    worker_status = TextField(default=None)
+    master_status = TextField(default=None)
 
 
 def worker(set_q, get_q):
@@ -311,11 +452,11 @@ if __name__ == "__main__":
 当然，你也可以接入`ConfigInMainProcessPipe`+`ConfigInChildProcessPipe`实现内存配置的多进程同步。
 
 ```python
-from xiaoe_config_manager import ConfigKeysBase, ConfigMemory, default
+from xiaoe_config_manager import ConfigKeysBase, ConfigMemory, ConfigField, IntField
 
 class AppKeys(ConfigKeysBase):
-    enable = default(False)
-    speed  = default(50)
+    enable = ConfigField(default=False)
+    speed  = IntField(default=50, range=(0, 100), step=1)
 
 class AppMemory(ConfigMemory, AppKeys):
     ...
@@ -428,13 +569,45 @@ Config(
 
 | 名字 | 说明 |
 |---|---|
-| `ConfigKeysBase` | 纯声明基类，`DEFAULTS` 是普通 dict，任何后端都能消费 |
+| `ConfigKeysBase` | 纯声明基类，`DEFAULTS` 是普通 dict，`FIELDS` 是字段对象表，任何后端都能消费 |
 | `ConfigDeclareMixin` | 把声明键做成实例上的 property，`ConfigBase` 已继承 |
-| `ConfigItemProxy[T]` | 字段句柄，有 `.get()` / `.set(v)` / `.reset()` / `.on(cb)` / `.off(cb)` 和 `.key` |
+| `ConfigItemProxy[T]` | 字段句柄，有 `.get()` / `.set(v)` / `.reset()` / `.on(cb)` / `.off(cb)`，以及 `.key` / `.field` |
 | `collect_defaults(cls)` | 扫出一个类认哪些键、默认值各是多少 |
-| `default(value)` / `default(None, type_)` | 声明默认值，同时承担类型推断 |
+| `default(value)` / `default(None, type_)` | 旧写法，只声明默认值和类型提示 |
 
 `ConfigItemProxy` 由 `ConfigDeclareMixin` 自动生成，不要手动实例化。
+
+### 字段类
+
+`ConfigField` 是基类，下面这些都是它的子类。**它们只描述值的形状，不做校验** ——
+范围、选项这些是「定义域」，存进 `FIELDS` 供界面层读，`set()` 时不会拿去拦。
+
+| 类 | 值类型 | 独有参数 |
+|---|---|---|
+| `ConfigField` | 由 `default` 决定 | — |
+| `NumberField` | `int \| float \| None` | `range`、`step`、`unit` |
+| `IntField` | `int \| None` | 同上，要求 `step` 和 `default` 都是整数 |
+| `FloatField` | `float \| None` | 同上，`default` 接受任何数 |
+| `ChoiceField` | 由 `options` 决定 | `options`、`store_index` |
+| `ColorField` | `list[int] \| None` | `rgba` |
+| `TextField` | `str \| None`（`value_type` 可改成数字） | `value_type` |
+| `DateField` | `str \| None` | `fmt` |
+| `ImageField` | `str \| None` | `file_filter`、`start_dir` |
+| `PathField` | `str \| None` | `mode`、`file_filter`、`start_dir`、`check_exists` |
+| `DictField` | `dict \| None` | `fields`（键固定） |
+| `ListField` | `list[T] \| None` | `item` |
+| `GradientField` | `list[dict] \| None` | `item`（自动填成色标形状） |
+
+公共参数：`default`、`title`、`desc`。
+
+`NumberField` 是两个数值字段的共同基类，所以「按 `NumberField` 判断」的代码同时
+覆盖 `IntField` / `FloatField`。
+
+```python
+from xiaoe_config_manager import NumberField
+
+isinstance(AppKeys.FIELDS["height"], NumberField)    # IntField -> True
+```
 
 ### ConfigInMainProcessPipe
 

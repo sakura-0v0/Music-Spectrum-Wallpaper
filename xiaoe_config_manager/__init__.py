@@ -13,6 +13,11 @@
 - :class:`ConfigDeclareMixin` 类：把声明键变成点操作属性（Config 系列已继承）
 - :class:`ConfigItemProxy` 类：点操作代理（``cfg.键名.get()/.set(v)/.reset()``）
 - :func:`default`：声明默认值
+- :class:`ConfigField` 以及 :class:`NumberField` / :class:`ChoiceField` /
+  :class:`ColorField` / :class:`TextField` / :class:`PathField`：配置项的
+  **额外属性**（范围、步进、选项、路径模式、标题、说明……）。它代替
+  ``default`` 写在声明处，只存储不校验；``cfg.键名.field`` 取得它，
+  没声明就是 ``None``
 - :data:`ConfigValue` / :data:`ConfigDict`：配置值的类型（给注解用）
 - :data:`DATA_TYPES`：由 ``ConfigValue`` 推导的运行时元组（给 ``isinstance`` 用）
 """
@@ -27,6 +32,23 @@ from .config_dot import (
     collect_defaults,
     default,
 )
+from .config_field import (
+    PATH_MODES,
+    ChoiceField,
+    ColorField,
+    ConfigField,
+    DateField,
+    DictField,
+    FloatField,
+    GradientField,
+    ImageField,
+    IntField,
+    ListField,
+    NumberField,
+    PathField,
+    PathMode,
+    TextField,
+)
 from .config_memory import ConfigMemory
 from .config_multiprocess import (
     ConfigInChildProcessPipe,
@@ -36,17 +58,32 @@ from .config_types import DATA_TYPES, ConfigDict, ConfigValue
 
 __all__ = [
     "DATA_TYPES",
+    "PATH_MODES",
     "Config",
     "ConfigApi",
     "ConfigBase",
     "ConfigDeclareMixin",
     "ConfigDict",
+    "ConfigField",
     "ConfigInChildProcessPipe",
     "ConfigInMainProcessPipe",
     "ConfigItemProxy",
     "ConfigKeysBase",
     "ConfigMemory",
     "ConfigValue",
+    "ChoiceField",
+    "ColorField",
+    "DateField",
+    "DictField",
+    "FloatField",
+    "GradientField",
+    "ImageField",
+    "IntField",
+    "ListField",
+    "NumberField",
+    "PathField",
+    "PathMode",
+    "TextField",
     "collect_defaults",
     "default",
 ]
