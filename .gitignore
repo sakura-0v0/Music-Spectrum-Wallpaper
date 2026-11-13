@@ -1,3 +1,16 @@
 /dist/
 /build/
 /.venv/
+/.idea/.gitignore
+/a.json
+/aaaa.json
+/cb.json
+/demo_config.json
+/f.json
+/fine.json
+/mp_config.json
+/mp_multi.json
+/nested.json
+/t.json
+/.idea/vcs.xml
+/.idea/xiaoe_config_manager.iml
