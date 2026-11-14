@@ -52,24 +52,6 @@ from typing import (
 if TYPE_CHECKING:
     from xiaoe_config_manager.config_dot import ConfigItemProxy
 
-__all__ = [
-    "PATH_MODES",
-    "ChoiceField",
-    "ColorField",
-    "ConfigField",
-    "DateField",
-    "DictField",
-    "FloatField",
-    "GradientField",
-    "ImageField",
-    "IntField",
-    "ListField",
-    "NumberField",
-    "PathField",
-    "PathMode",
-    "TextField",
-]
-
 T = TypeVar("T")
 
 
@@ -215,6 +197,29 @@ class ConfigField(Generic[T]):
             第二个重载只服务类型检查器。
         """
         return self.default
+
+
+@dataclass(frozen=True, kw_only=True)
+class BoolField(ConfigField[bool | None]):
+    """开关配置项：**一个真 / 假**。
+
+    值是 ``bool``，不带任何范围或选项 —— 勾选框那个东西就是它。
+
+    **别用 ``ConfigField(default=False)`` 代替它**：``ConfigField`` 的类型参数
+    要等检查器从 ``default`` 推，写出来是 ``T``（没有约束），``cfg.开关.get()``
+    最终落成 ``Any``。这个类把 ``T`` 固定成 ``bool | None``，注解才是真的。
+
+    Args:
+        default: 默认值，``True`` / ``False`` / ``None``。
+        title: 行标题。
+        desc: 补充说明。
+
+    Examples:
+        ::
+
+            enable = BoolField(default=False, title="启用")
+            cfg.enable.get()        # -> bool | None
+    """
 
 
 @dataclass(frozen=True, kw_only=True)

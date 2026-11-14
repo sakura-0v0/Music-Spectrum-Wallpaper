@@ -58,12 +58,12 @@ pip install xiaoe-config-manager
 声明Keys类，与Config类组合并实例化：
 
 ```python
-from xiaoe_config_manager import Config, ConfigField, ConfigKeysBase, IntField, TextField
+from xiaoe_config_manager import Config, BoolField, ConfigKeysBase, IntField, TextField
 
 class AppKeys(ConfigKeysBase):
     app_name = TextField(default="myapp")
     timeout  = IntField(default=30, range=(0, 600), step=1, unit="秒")
-    debug    = ConfigField(default=False)
+    debug    = BoolField(default=False)
 
 class AppConfig(Config, AppKeys):
     ...
@@ -86,7 +86,7 @@ cfg.flush()             # 立刻落盘，不等定时器
 
 | 字段类 | 值类型 | 必填 / 常用参数 |
 |---|---|---|
-| `ConfigField` | 由 `default` 决定 | `default` |
+| `BoolField` | `bool \| None` | `default` |
 | `TextField` | `str \| None` | `default` |
 | `IntField` | `int \| None` | `range`、`step`，可选 `unit` |
 | `FloatField` | `float \| None` | `range`、`step`，可选 `unit` |
@@ -100,6 +100,10 @@ cfg.flush()             # 立刻落盘，不等定时器
 | `GradientField` | `list[dict] \| None` | 色标列表，每项 `{"pos": float, "color": [r,g,b,a]}` |
 
 所有字段都支持 `title` / `desc` 两个描述性 slot。
+
+`ConfigField` 是它们的基类，**业务里不需要直接用它** —— 它的类型参数是从
+`default` 推的，写出来是 `T`（没有约束），`cfg.键.get()` 会落成 `Any`。
+只在你要派生自己的字段类时才继承它。
 
 ```python
 class AppKeys(ConfigKeysBase):
@@ -207,7 +211,8 @@ cfg.timeout.set("oops")             # 类型检查报错
 `None`，而且都合法：`default=None`（没设）、用户手改 `app.json` 删了那个键、旧版本
 配置里还没有这个键。所以 `cfg.path.get()` 的静态类型是 `str | None`，用之前要判空。
 
-想让类型更紧，就用基类自己标：
+想让类型更紧，就用基类自己标（**这是 `ConfigField` 唯一的正经用法** ——
+它没有专用子类时才拿它当「给定类型参数的通用字段」）：
 
 ```python
 from xiaoe_config_manager import ConfigField
@@ -452,10 +457,10 @@ if __name__ == "__main__":
 当然，你也可以接入`ConfigInMainProcessPipe`+`ConfigInChildProcessPipe`实现内存配置的多进程同步。
 
 ```python
-from xiaoe_config_manager import ConfigKeysBase, ConfigMemory, ConfigField, IntField
+from xiaoe_config_manager import ConfigKeysBase, ConfigMemory, BoolField, IntField
 
 class AppKeys(ConfigKeysBase):
-    enable = ConfigField(default=False)
+    enable = BoolField(default=False)
     speed  = IntField(default=50, range=(0, 100), step=1)
 
 class AppMemory(ConfigMemory, AppKeys):
@@ -584,7 +589,8 @@ Config(
 
 | 类 | 值类型 | 独有参数 |
 |---|---|---|
-| `ConfigField` | 由 `default` 决定 | — |
+| `ConfigField` | 由 `default` 决定 | —（基类，别直接用） |
+| `BoolField` | `bool \| None` | — |
 | `NumberField` | `int \| float \| None` | `range`、`step`、`unit` |
 | `IntField` | `int \| None` | 同上，要求 `step` 和 `default` 都是整数 |
 | `FloatField` | `float \| None` | 同上，`default` 接受任何数 |

@@ -13,8 +13,9 @@
 - :class:`ConfigDeclareMixin` 类：把声明键变成点操作属性（Config 系列已继承）
 - :class:`ConfigItemProxy` 类：点操作代理（``cfg.键名.get()/.set(v)/.reset()``）
 - :func:`default`：声明默认值
-- :class:`ConfigField` 以及 :class:`NumberField` / :class:`ChoiceField` /
-  :class:`ColorField` / :class:`TextField` / :class:`PathField`：配置项的
+- :class:`ConfigField` 以及 :class:`BoolField` / :class:`NumberField` /
+  :class:`IntField` / :class:`FloatField` / :class:`ChoiceField` /
+  :class:`ColorField` / :class:`TextField` / :class:`PathField` 等：配置项的
   **额外属性**（范围、步进、选项、路径模式、标题、说明……）。它代替
   ``default`` 写在声明处，只存储不校验；``cfg.键名.field`` 取得它，
   没声明就是 ``None``
@@ -34,6 +35,7 @@ from .config_dot import (
 )
 from .config_field import (
     PATH_MODES,
+    BoolField,
     ChoiceField,
     ColorField,
     ConfigField,
@@ -59,6 +61,7 @@ from .config_types import DATA_TYPES, ConfigDict, ConfigValue
 __all__ = [
     "DATA_TYPES",
     "PATH_MODES",
+    "BoolField",
     "Config",
     "ConfigApi",
     "ConfigBase",
